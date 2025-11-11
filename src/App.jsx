@@ -10,6 +10,9 @@ import { Loader2, CheckCircle, XCircle, Clock, AlertCircle } from 'lucide-react'
  *  - EIP-1559 gas handling (maxFeePerGas/maxPriorityFeePerGas)
  */
 const OpenSeaAutoMint = () => {
+  // Optional: set your OpenSea API key here or via UI input
+  const [OPENSEA_API_KEY, setOPENSEA_API_KEY] = useState('');
+
   const [config, setConfig] = useState({
     collectionUrl: '',
     contractAddress: '',
@@ -76,6 +79,16 @@ const OpenSeaAutoMint = () => {
     if (addressMatch) return { type: 'address', address: addressMatch[0] };
     return null;
   };
+
+  const getOSChainSlug = (chainId) => ({
+    1: 'ethereum',
+    11155111: 'sepolia',
+    137: 'polygon',
+    42161: 'arbitrum',
+    10: 'optimism',
+    8453: 'base',
+    # ApeChain not supported by OpenSea (skip)
+  }[chainId] || 'ethereum');
 
   const SEAPORT_ADDRESSES = {
     1: '0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC',
@@ -420,12 +433,58 @@ const OpenSeaAutoMint = () => {
     return tx.hash;
   };
 
+  
+  // --- OpenSea Launchpad / Seaport helpers ---
+  const fetchOSListingsByCollection = async (slug, chainSlug, limit = 1) => {
+    const url = `https://api.opensea.io/api/v2/listings/collection/${slug}?limit=${limit}&order_by=price&order_direction=asc`;
+    const res = await fetch(url, { headers: { 'X-API-KEY': OPENSEA_API_KEY } });
+    if (!res.ok) throw new Error(`OpenSea listings error: ${res.status}`);
+    const data = await res.json();
+    return data && data.listings ? data.listings : [];
+  };
+
+  const generateOSFulfillmentForListing = async (listing, taker, chainSlug) => {
+    const url = `https://api.opensea.io/api/v2/listings/fulfillment_data`;
+    const body = { listing, chain: chainSlug, fulfiller: { address: taker } };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': OPENSEA_API_KEY },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`fulfillment_data error: ${res.status} ${txt}`);
+    }
+    const data = await res.json();
+    return data && data.fulfillment_data ? data.fulfillment_data : null;
+  };
+
+  const mintViaOpenSeaLaunchpad = async (slug, provider, wallet) => {
+    const chainSlug = getOSChainSlug((await provider.getNetwork()).chainId);
+    addLog(`🔎 Fetching OpenSea listings for ${slug} on ${chainSlug}...`, 'info');
+    const listings = await fetchOSListingsByCollection(slug, chainSlug, 1);
+    if (!listings.length) throw new Error('No listings found on OpenSea.');
+    const listing = listings[0];
+    addLog('🧾 Listing found, generating fulfillment...', 'info');
+    const fulfill = await generateOSFulfillmentForListing(listing, wallet.address, chainSlug);
+    const tx = fulfill?.transaction;
+    if (!tx?.to || !tx?.data) throw new Error('Invalid fulfillment tx data.');
+    const value = tx.value ? BigInt(tx.value) : 0n;
+    addLog('📤 Sending Seaport fulfillment tx...', 'info');
+    const sent = await wallet.sendTransaction({ to: tx.to, data: tx.data, value });
+    addLog(`⏳ Confirming... TX: ${sent.hash}`, 'info');
+    const rc = await sent.wait();
+    if (rc.status !== 1) throw new Error('Fulfillment reverted');
+    return sent.hash;
+  };
+
   const startMinting = async () => {
     if (!ethersRef.current) return addLog('❌ Ethers.js not loaded yet', 'error');
     if (!wallets.length) return addLog('❌ Jalankan scan dulu', 'error');
     if (!collectionInfo) return addLog('❌ Collection info belum siap', 'error');
-    if (seaportDetected && advancedOptions.useSeaport)
-      return addLog('❌ Seaport drop perlu order fulfillment — tidak mint langsung', 'error');
+    if (seaportDetected && advancedOptions.useSeaport && !config.collectionUrl) {
+      return addLog('❌ Seaport drop terdeteksi. Isi OpenSea collection URL agar bisa fulfill via API.', 'error');
+    }
 
     const selected = Object.keys(mintPhases).filter((k) => mintPhases[k]);
     if (!selected.length) return addLog('❌ Pilih minimal satu phase mint', 'error');
@@ -476,8 +535,18 @@ const OpenSeaAutoMint = () => {
           await new Promise((r) => setTimeout(r, 1200));
         }
         try {
-          hash = await executeMint(w, provider);
-          success = true;
+          // If we have OpenSea API key + collection URL, try Seaport fulfillment first
+          if (OPENSEA_API_KEY && config.collectionUrl) {
+            const extracted = extractContractFromUrl(config.collectionUrl);
+            if (extracted?.type === 'collection') {
+              hash = await mintViaOpenSeaLaunchpad(extracted.slug, provider, new ethersRef.current.Wallet(w.privateKey, provider));
+              success = true;
+            }
+          }
+          if (!success) {
+            hash = await executeMint(w, provider);
+            success = true;
+          }
           addLog(`✅ SUCCESS! TX: ${hash}`, 'success');
         } catch (e) {
           const msg = e?.message || 'Unknown error';
@@ -550,6 +619,8 @@ const OpenSeaAutoMint = () => {
             <input className="w-full bg-slate-900 rounded p-2 text-sm" placeholder="https://..." value={config.rpcUrl} onChange={(e)=>setConfig({...config, rpcUrl:e.target.value})}/>
             <label className="block text-sm mt-2">Private Keys (satu per baris)</label>
             <textarea className="w-full bg-slate-900 rounded p-2 text-sm h-24" value={config.privateKeys} onChange={(e)=>setConfig({...config, privateKeys:e.target.value})}/>
+            <label className="block text-sm mt-2">OpenSea API Key (opsional untuk Launchpad/Seaport)</label>
+            <input className="w-full bg-slate-900 rounded p-2 text-sm" placeholder="opensea_api_key_..." value={OPENSEA_API_KEY} onChange={(e)=>setOPENSEA_API_KEY(e.target.value)}/>
             <div className="flex gap-2 items-center mt-2">
               <span className="text-sm">Gas:</span>
               <select className="bg-slate-900 rounded p-2 text-sm" value={config.gasLevel} onChange={(e)=>setConfig({...config, gasLevel:e.target.value})}>
