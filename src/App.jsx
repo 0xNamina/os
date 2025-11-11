@@ -188,7 +188,7 @@ const OpenSeaAutoMint = () => {
       "function publicSaleActive() public view returns (bool)",
       "function saleIsActive() public view returns (bool)"
     ];
-  };
+
     }
     
     try {
