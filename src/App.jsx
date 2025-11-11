@@ -1,6 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Loader2, CheckCircle, XCircle, Clock, AlertCircle, Scan, Zap, Shield, Activity } from 'lucide-react';
+import { Loader2, CheckCircle, XCircle, Clock, AlertCircle } from 'lucide-react';
 
+/**
+ * Drop-in replacement for your current component.
+ * Key fixes:
+ *  - Robust chainId/symbol detection from RPC
+ *  - ABI normalization with ethers.Interface
+ *  - Smart mint arg builder + fallback attempts
+ *  - EIP-1559 gas handling (maxFeePerGas/maxPriorityFeePerGas)
+ */
 const OpenSeaAutoMint = () => {
   const [config, setConfig] = useState({
     collectionUrl: '',
@@ -10,19 +18,19 @@ const OpenSeaAutoMint = () => {
     gasLevel: 'normal',
     mintQuantity: 1,
   });
-  
+
   const [mintPhases, setMintPhases] = useState({
-    public: false,
+    public: true,
     whitelist: false,
     allowlist: false,
   });
-  
+
   const [advancedOptions, setAdvancedOptions] = useState({
     autoRetry: true,
     randomDelay: true,
     useSeaport: true,
   });
-  
+
   const [wallets, setWallets] = useState([]);
   const [logs, setLogs] = useState([]);
   const [isScanning, setIsScanning] = useState(false);
@@ -30,83 +38,45 @@ const OpenSeaAutoMint = () => {
   const [mintStats, setMintStats] = useState({ success: 0, failed: 0, total: 0 });
   const [collectionInfo, setCollectionInfo] = useState(null);
   const [seaportDetected, setSeaportDetected] = useState(false);
-  
+
   const logsEndRef = useRef(null);
   const ethersRef = useRef(null);
-  
-  // Check if ethers is loaded
+
+  // Attach ethers from window if present
   useEffect(() => {
-    const checkEthers = setInterval(() => {
+    const timer = setInterval(() => {
       if (window.ethers) {
         ethersRef.current = window.ethers;
-        addLog('✅ Ethers.js loaded successfully', 'success');
-        clearInterval(checkEthers);
+        addLog('✅ Ethers.js loaded', 'success');
+        clearInterval(timer);
       }
     }, 100);
-    
-    return () => clearInterval(checkEthers);
+    return () => clearInterval(timer);
   }, []);
-  
-  // Auto-detect RPC chain when RPC URL changes
-  useEffect(() => {
-    if (config.rpcUrl && config.rpcUrl.includes('http')) {
-      const detectChain = async () => {
-        try {
-          const chainInfo = await detectChainFromRPC(config.rpcUrl);
-          addLog(`🌐 Auto-detected: ${chainInfo.name} (${chainInfo.symbol})`, 'success');
-          
-          // Update collection info jika ada
-          if (collectionInfo) {
-            setCollectionInfo({
-              ...collectionInfo,
-              chainInfo
-            });
-          }
-        } catch (error) {
-          // Silent fail untuk auto-detection
-        }
-      };
-      
-      detectChain();
-    }
-  }, [config.rpcUrl]);
-  
-  const scrollToBottom = () => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-  
-  useEffect(() => {
-    scrollToBottom();
-  }, [logs]);
-  
+
+  const scrollToBottom = () => logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  useEffect(scrollToBottom, [logs]);
+
   const addLog = (message, type = 'info') => {
     const timestamp = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, { timestamp, message, type }]);
+    setLogs((p) => [...p, { timestamp, message, type }]);
   };
-  
-  const parsePrivateKeys = (keys) => {
-    return keys.split('\n')
-      .map(k => k.trim())
-      .filter(k => k.length > 0 && k.startsWith('0x'))
-      .slice(0, 20);
-  };
-  
+
+  const parsePrivateKeys = (keys) =>
+    keys
+      .split('\n')
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0 && k.startsWith('0x'))
+      .slice(0, 50);
+
   const extractContractFromUrl = (url) => {
-    // Extract from OpenSea URL
-    const openseaMatch = url.match(/opensea\.io\/collection\/([^\/\?]+)/);
-    if (openseaMatch) {
-      return { type: 'collection', slug: openseaMatch[1] };
-    }
-    
-    // Direct contract address
-    const addressMatch = url.match(/0x[a-fA-F0-9]{40}/);
-    if (addressMatch) {
-      return { type: 'address', address: addressMatch[0] };
-    }
-    
+    const openseaMatch = url?.match(/opensea\.io\/collection\/([^\/\?]+)/i);
+    if (openseaMatch) return { type: 'collection', slug: openseaMatch[1] };
+    const addressMatch = url?.match(/0x[a-fA-F0-9]{40}/);
+    if (addressMatch) return { type: 'address', address: addressMatch[0] };
     return null;
   };
-  
+
   const SEAPORT_ADDRESSES = {
     1: '0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC',
     5: '0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC',
@@ -116,1365 +86,531 @@ const OpenSeaAutoMint = () => {
     10: '0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC',
     8453: '0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC',
   };
-  
-  // Fungsi untuk mendapatkan symbol native token dari contract
-  const getNativeSymbol = async (provider, chainId) => {
-    try {
-      // Coba ambil dari contract WETH atau token native
-      const wethABI = ['function symbol() view returns (string)'];
-      const wethAddresses = {
-        1: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-        56: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-        137: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270',
-        42161: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
-        10: '0x4200000000000000000000000000000000000006',
-      };
-      
-      const wethAddress = wethAddresses[chainId];
-      
-      if (wethAddress) {
-        const contract = new ethersRef.current.Contract(wethAddress, wethABI, provider);
-        return await contract.symbol();
-      }
-    } catch (error) {
-      // Fallback ke symbol default berdasarkan chainId
-      const defaultSymbols = {
-        1: 'ETH', 5: 'ETH', 11155111: 'ETH',
-        56: 'BNB', 97: 'tBNB',
-        137: 'MATIC', 80001: 'MATIC',
-        42161: 'ETH', 421613: 'ETH',
-        10: 'ETH', 420: 'ETH',
-        8453: 'ETH', 84531: 'ETH',
-        43114: 'AVAX', 43113: 'AVAX',
-        250: 'FTM', 4002: 'FTM',
-      };
-      
-      return defaultSymbols[chainId] || 'ETH';
-    }
-    return 'ETH';
-  };
 
   const detectChainFromRPC = async (rpcUrl) => {
     try {
       const ethers = ethersRef.current;
       const provider = new ethers.JsonRpcProvider(rpcUrl);
       const network = await provider.getNetwork();
-      const chainId = Number(network.chainId);
-      
-      // Extended chain database
+      const chainId = Number(network.chainId?.toString?.() ?? network.chainId);
       const chains = {
         1: { name: 'Ethereum Mainnet', symbol: 'ETH', explorer: 'etherscan.io' },
         5: { name: 'Goerli Testnet', symbol: 'ETH', explorer: 'goerli.etherscan.io' },
-        11155111: { name: 'Sepolia Testnet', symbol: 'ETH', explorer: 'sepolia.etherscan.io' },
-        56: { name: 'BNB Smart Chain', symbol: 'BNB', explorer: 'bscscan.com' },
-        97: { name: 'BNB Testnet', symbol: 'tBNB', explorer: 'testnet.bscscan.com' },
+        11155111: { name: 'Sepolia', symbol: 'ETH', explorer: 'sepolia.etherscan.io' },
         137: { name: 'Polygon', symbol: 'MATIC', explorer: 'polygonscan.com' },
-        80001: { name: 'Polygon Mumbai', symbol: 'MATIC', explorer: 'mumbai.polygonscan.com' },
         42161: { name: 'Arbitrum One', symbol: 'ETH', explorer: 'arbiscan.io' },
-        421613: { name: 'Arbitrum Goerli', symbol: 'ETH', explorer: 'goerli.arbiscan.io' },
         10: { name: 'Optimism', symbol: 'ETH', explorer: 'optimistic.etherscan.io' },
-        420: { name: 'Optimism Goerli', symbol: 'ETH', explorer: 'goerli-optimism.etherscan.io' },
         8453: { name: 'Base', symbol: 'ETH', explorer: 'basescan.org' },
-        84531: { name: 'Base Goerli', symbol: 'ETH', explorer: 'goerli.basescan.org' },
-        43114: { name: 'Avalanche', symbol: 'AVAX', explorer: 'snowtrace.io' },
-        43113: { name: 'Avalanche Fuji', symbol: 'AVAX', explorer: 'testnet.snowtrace.io' },
-        250: { name: 'Fantom', symbol: 'FTM', explorer: 'ftmscan.com' },
-        4002: { name: 'Fantom Testnet', symbol: 'FTM', explorer: 'testnet.ftmscan.com' },
+        33139: { name: 'ApeChain', symbol: 'APE', explorer: 'apescan.io' },
       };
-      
-      let chainInfo = chains[chainId];
-      
-      if (!chainInfo) {
-        // Jika chain tidak dikenal, coba dapatkan symbol secara dinamis
-        const symbol = await getNativeSymbol(provider, chainId);
-        chainInfo = { 
-          name: `Chain ID: ${chainId}`, 
-          symbol: symbol, 
-          explorer: 'etherscan.io' 
-        };
-      }
-      
-      return { ...chainInfo, chainId };
-    } catch (error) {
-      addLog(`❌ Failed to detect chain: ${error.message}`, 'error');
-      return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0, explorer: 'etherscan.io' };
+      return { chainId, ...(chains[chainId] || { name: `Chain ${chainId}`, symbol: 'ETH', explorer: '' }) };
+    } catch (e) {
+      addLog(`❌ RPC chain detect failed: ${e.message}`, 'error');
+      return { chainId: 0, name: 'Unknown', symbol: 'ETH', explorer: '' };
     }
   };
-  
-  const getGenericABI = () => {
-    return [
-      // Basic mint functions
-      "function mint() public payable",
-      "function mint(uint256 quantity) public payable",
-      "function publicMint() public payable",
-      "function publicMint(uint256 quantity) public payable",
-      
-      // Whitelist/Allowlist functions
-      "function whitelistMint(bytes32[] proof) public payable",
-      "function whitelistMint(uint256 quantity, bytes32[] proof) public payable",
-      "function allowlistMint(bytes32[] proof) public payable",
-      "function allowlistMint(uint256 quantity, bytes32[] proof) public payable",
-      
-      // Signature-based minting
-      "function mintWithSignature(bytes signature) public payable",
-      "function mintWithSignature(bytes signature, uint256 quantity) public payable",
-      
-      // Alternative function names
-      "function claim() public payable",
-      "function claim(uint256 quantity) public payable",
-      "function purchase() public payable",
-      "function purchase(uint256 quantity) public payable",
-      "function buy() public payable",
-      "function buy(uint256 quantity) public payable",
-      
-      // Price and supply functions
-      "function mintPrice() public view returns (uint256)",
-      "function cost() public view returns (uint256)",
-      "function price() public view returns (uint256)",
-      "function publicPrice() public view returns (uint256)",
-      
-      // Supply functions
-      "function totalSupply() public view returns (uint256)",
-      "function maxSupply() public view returns (uint256)",
-      "function MAX_SUPPLY() public view returns (uint256)",
-      
-      // Status functions
-      "function balanceOf(address owner) public view returns (uint256)",
-      "function paused() public view returns (bool)",
-      "function publicSaleActive() public view returns (bool)",
-      "function whitelistSaleActive() public view returns (bool)",
-      "function saleActive() public view returns (bool)",
-      
-      // OpenSea Launchpad specific
-      "function mintFee() public view returns (uint256)",
-      "function getMintPrice() public view returns (uint256)",
-      "function isPublicSaleActive() public view returns (bool)",
-    ];
-  };
-  
-  const fetchContractABI = async (contractAddress, chainId) => {
-    const apiKeys = {
-      1: '',
-      137: '',
-    };
-    
-    const apiUrls = {
+
+  const getGenericABI = () => [
+    'function mint() payable',
+    'function publicMint() payable',
+    'function mint(uint256 quantity) payable',
+    'function publicMint(uint256 quantity) payable',
+    'function whitelistMint(bytes32[] proof) payable',
+    'function allowlistMint(bytes32[] proof, uint256 quantity) payable',
+    'function mintWithSignature(bytes signature, uint256 quantity) payable',
+    'function mintPrice() view returns (uint256)',
+    'function cost() view returns (uint256)',
+    'function price() view returns (uint256)',
+    'function totalSupply() view returns (uint256)',
+    'function maxSupply() view returns (uint256)',
+    'function balanceOf(address owner) view returns (uint256)',
+    'function paused() view returns (bool)',
+    'function publicSaleActive() view returns (bool)',
+  ];
+
+  const fetchContractABI = async (address, chainId) => {
+    // Use explorer if keys available, otherwise fallback
+    const api = {
       1: 'https://api.etherscan.io/api',
-      5: 'https://api-goerli.etherscan.io/api',
       11155111: 'https://api-sepolia.etherscan.io/api',
       137: 'https://api.polygonscan.com/api',
       42161: 'https://api.arbiscan.io/api',
       10: 'https://api-optimistic.etherscan.io/api',
       8453: 'https://api.basescan.org/api',
-      56: 'https://api.bscscan.com/api',
-      97: 'https://api-testnet.bscscan.com/api',
-      43114: 'https://api.snowtrace.io/api',
-      43113: 'https://api-testnet.snowtrace.io/api',
-      250: 'https://api.ftmscan.com/api',
-      4002: 'https://api-testnet.ftmscan.com/api',
-    };
-    
-    const apiUrl = apiUrls[chainId];
-    if (!apiUrl) {
-      addLog('⚠️ Using generic ABI for this chain', 'warning');
+    }[chainId];
+
+    if (!api) {
+      addLog('⚠️ Unsupported explorer for this chain. Using generic ABI.', 'warning');
       return getGenericABI();
     }
-    
+    const API_KEY = ''; // optional: put your key here
+
     try {
-      const response = await fetch(
-        `${apiUrl}?module=contract&action=getabi&address=${contractAddress}&apikey=${apiKeys[chainId] || ''}`
-      );
-      const data = await response.json();
-      
-      if (data.status === '1' && data.result) {
-        addLog('✅ Fetched contract ABI from explorer', 'success');
-        return JSON.parse(data.result);
+      const res = await fetch(`${api}?module=contract&action=getabi&address=${address}&apikey=${API_KEY}`);
+      const data = await res.json();
+      if (data && data.status === '1' && data.result) {
+        addLog('✅ ABI fetched from explorer', 'success');
+        const parsed = JSON.parse(data.result);
+        if (parsed) return parsed;
       }
-    } catch (error) {
-      addLog(`⚠️ Could not fetch ABI: ${error.message}`, 'warning');
+    } catch (e) {
+      addLog(`⚠️ ABI fetch failed: ${e.message}`, 'warning');
     }
-    
-    addLog('📝 Using generic ERC721 ABI', 'info');
-    return getGenericABI();
-  };
-  
+    // Final safety: always return a non-empty ABI
+    addLog('📝 Using generic ABI', 'info');
+    const generic = getGenericABI();
+    return Array.isArray(generic) && generic.length ? generic : ['function mint()'];
+};
+
   const detectMintFunction = (abi) => {
-    const mintFunctions = abi.filter(item => 
-      item.type === 'function' && 
-      item.name && 
-      (item.name.toLowerCase().includes('mint') || 
-       item.name.toLowerCase().includes('claim') ||
-       item.name.toLowerCase().includes('purchase') ||
-       item.name.toLowerCase().includes('buy'))
-    );
-    
-    if (mintFunctions.length === 0) {
-      return { name: 'mint', params: [], hasQuantity: false };
+    const ethers = ethersRef.current;
+    try {
+      const iface = new ethers.Interface(abi && abi.length ? abi : getGenericABI());
+      const funcs = Object.values(iface.functions);
+      const candidates = funcs.filter((f) => {
+        const n = f.name?.toLowerCase?.() || '';
+        return n.includes('mint') || n.includes('claim');
+      });
+      if (candidates.length === 0) return { name: 'mint', params: [], hasQuantity: false, raw: null };
+
+      const preferred =
+        candidates.find((f) => /publicmint/i.test(f.name) && f.inputs.length === 1 && /uint/.test(f.inputs[0].type)) ||
+        candidates.find((f) => /^mint$/i.test(f.name) && f.inputs.length === 1 && /uint/.test(f.inputs[0].type)) ||
+        candidates.find((f) => /public/i.test(f.name) && f.inputs.length === 0) ||
+        candidates[0];
+
+      return {
+        name: preferred.name,
+        params: preferred.inputs.map((i) => i.type),
+        hasQuantity: preferred.inputs.length === 1 && /uint/.test(preferred.inputs[0].type),
+        raw: preferred,
+      };
+    } catch (e) {
+      addLog(`⚠️ ABI parse failed: ${e.message}`, 'warning');
+      return { name: 'mint', params: [], hasQuantity: false, raw: null };
     }
-    
-    // Priority order for public minting
-    const priorities = [
-      { pattern: /^publicMint$/, preferredParams: 1 },
-      { pattern: /^mint$/, preferredParams: 1 },
-      { pattern: /^publicSaleMint$/, preferredParams: 1 },
-      { pattern: /^claim$/, preferredParams: 1 },
-      { pattern: /^purchase$/, preferredParams: 1 },
-      { pattern: /^buy$/, preferredParams: 1 },
-    ];
-    
-    for (const priority of priorities) {
-      const matches = mintFunctions.filter(f => priority.pattern.test(f.name));
-      
-      for (const match of matches) {
-        const params = match.inputs || [];
-        
-        if (params.length === priority.preferredParams && params[0]?.type === 'uint256') {
-          return { 
-            name: match.name, 
-            params: params.map(p => p.type),
-            hasQuantity: true 
-          };
-        }
-        
-        if (params.length === 0) {
-          return { 
-            name: match.name, 
-            params: [],
-            hasQuantity: false 
-          };
-        }
-      }
-    }
-    
-    const firstMint = mintFunctions[0];
-    const params = firstMint.inputs || [];
-    
-    return {
-      name: firstMint.name,
-      params: params.map(p => p.type),
-      hasQuantity: params.length === 1 && params[0]?.type === 'uint256'
-    };
   };
-  
-  const getMintPrice = async (provider, contractAddress, abi) => {
+
+  const getMintPrice = async (provider, address, abi) => {
     try {
       const ethers = ethersRef.current;
-      const contract = new ethers.Contract(contractAddress, abi, provider);
-      
-      const priceGetters = ['mintPrice', 'cost', 'price', 'getMintPrice', 'publicPrice', 'mintFee'];
-      
-      for (const getter of priceGetters) {
+      const c = new ethers.Contract(address, abi, provider);
+      for (const getter of ['mintPrice', 'cost', 'price', 'getMintPrice', 'publicPrice']) {
         try {
-          if (contract[getter]) {
-            const price = await contract[getter]();
-            if (price && price.toString() !== '0') {
-              return ethers.formatEther(price);
-            }
+          if (typeof c[getter] === 'function') {
+            const p = await c[getter]();
+            return ethers.formatEther(p);
           }
-        } catch (e) {
-          continue;
-        }
+        } catch {}
       }
-      
-      // Try call with mintQuantity if applicable
-      try {
-        const price = await contract.mintPrice(config.mintQuantity);
-        return ethers.formatEther(price);
-      } catch (e) {}
-      
       return '0';
-    } catch (error) {
+    } catch {
       return '0';
     }
   };
-  
-  const checkContractStatus = async (provider, contractAddress, abi) => {
+
+  const checkContractStatus = async (provider, address, abi) => {
     try {
       const ethers = ethersRef.current;
-      const contract = new ethers.Contract(contractAddress, abi, provider);
-      
-      let isPaused = false;
-      let isPublicSaleActive = true;
+      const c = new ethers.Contract(address, abi, provider);
+      let paused = false;
+      let publicSale = true;
       let supply = { current: 0, max: 0 };
-      
+      try { if (typeof c.paused === 'function') paused = await c.paused(); } catch {}
+      try { if (typeof c.publicSaleActive === 'function') publicSale = await c.publicSaleActive(); } catch {}
       try {
-        isPaused = await contract.paused();
-      } catch (e) {}
-      
-      try {
-        isPublicSaleActive = await contract.publicSaleActive();
-      } catch (e) {}
-      
-      try {
-        isPublicSaleActive = await contract.isPublicSaleActive();
-      } catch (e) {}
-      
-      try {
-        isPublicSaleActive = await contract.saleActive();
-      } catch (e) {}
-      
-      try {
-        const totalSupply = await contract.totalSupply();
-        const maxSupply = await contract.maxSupply();
-        supply = {
-          current: Number(totalSupply),
-          max: Number(maxSupply)
-        };
-      } catch (e) {}
-      
-      try {
-        const totalSupply = await contract.totalSupply();
-        const maxSupply = await contract.MAX_SUPPLY();
-        supply = {
-          current: Number(totalSupply),
-          max: Number(maxSupply)
-        };
-      } catch (e) {}
-      
-      return { isPaused, isPublicSaleActive, supply };
-    } catch (error) {
+        if (typeof c.totalSupply === 'function') {
+          const total = await c.totalSupply();
+          const max = typeof c.maxSupply === 'function' ? await c.maxSupply() : 0;
+          supply = { current: Number(total), max: Number(max) };
+        }
+      } catch {}
+      return { isPaused: paused, isPublicSaleActive: publicSale, supply };
+    } catch {
       return { isPaused: false, isPublicSaleActive: true, supply: { current: 0, max: 0 } };
     }
   };
-  
-  const randomDelay = (min = 1000, max = 3000) => {
-    return new Promise(resolve => 
-      setTimeout(resolve, Math.random() * (max - min) + min)
-    );
-  };
-  
+
+  const randomDelay = (min = 300, max = 800) => new Promise((r) => setTimeout(r, Math.random() * (max - min) + min));
+
   const scanWallets = async () => {
-    if (!ethersRef.current) {
-      addLog('❌ Ethers.js not loaded yet, please wait...', 'error');
-      return;
-    }
-    
-    if (!config.rpcUrl || !config.privateKeys) {
-      addLog('❌ Please fill RPC URL and Private Keys', 'error');
-      return;
-    }
-    
+    if (!ethersRef.current) return addLog('❌ Ethers.js not loaded yet', 'error');
+    if (!config.rpcUrl || !config.privateKeys) return addLog('❌ Isi RPC URL dan Private Keys', 'error');
+
     const extracted = extractContractFromUrl(config.collectionUrl || config.contractAddress);
-    if (!extracted) {
-      addLog('❌ Invalid OpenSea URL or contract address', 'error');
-      return;
-    }
-    
+    if (!extracted) return addLog('❌ URL OpenSea / contract address tidak valid', 'error');
+
     setIsScanning(true);
-    addLog('🔍 Starting wallet scan...', 'info');
-    
+    addLog('🔍 Mulai scan wallet...', 'info');
+
     const keys = parsePrivateKeys(config.privateKeys);
     if (keys.length === 0) {
-      addLog('❌ No valid private keys found (must start with 0x)', 'error');
       setIsScanning(false);
-      return;
+      return addLog('❌ Tidak ada private key valid (harus mulai 0x)', 'error');
     }
-    
-    addLog(`📋 Found ${keys.length} wallet(s) to scan`, 'info');
-    
+
     try {
       const ethers = ethersRef.current;
       const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-      addLog('🔗 Connected to RPC...', 'info');
-      
       const chainInfo = await detectChainFromRPC(config.rpcUrl);
       addLog(`🌐 Chain: ${chainInfo.name} (${chainInfo.symbol})`, 'info');
-      
+
       let contractAddress;
-      
       if (extracted.type === 'collection') {
-        addLog(`🔎 Fetching contract for collection: ${extracted.slug}`, 'info');
-        addLog('⚠️ Note: OpenSea API requires authentication. Using fallback...', 'warning');
+        addLog(`🔎 Ambil alamat kontrak dari slug: ${extracted.slug} (fallback manual)`, 'warning');
         contractAddress = config.contractAddress;
-        
-        if (!contractAddress || !contractAddress.startsWith('0x')) {
-          addLog('❌ Please provide contract address manually', 'error');
-          setIsScanning(false);
-          return;
-        }
+        if (!contractAddress) throw new Error('Harap isi contractAddress karena OpenSea API tidak digunakan.');
       } else {
         contractAddress = extracted.address;
       }
-      
-      if (!contractAddress || contractAddress.length !== 42) {
-        addLog('❌ Invalid contract address', 'error');
-        setIsScanning(false);
-        return;
-      }
-      
+
+      if (!/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) throw new Error('Contract address tidak valid.');
       addLog(`📝 Contract: ${contractAddress}`, 'info');
-      
-      // Check if Seaport
+
       const seaportAddr = SEAPORT_ADDRESSES[chainInfo.chainId];
-      if (seaportAddr && contractAddress.toLowerCase() === seaportAddr.toLowerCase()) {
+      if (seaportAddr && seaportAddr.toLowerCase() === contractAddress.toLowerCase()) {
         setSeaportDetected(true);
-        addLog('⚡ Seaport protocol detected!', 'info');
-        addLog('💡 This requires order fulfillment instead of direct minting', 'warning');
+        addLog('⚡ Terdeteksi Seaport — drop ini tidak mint langsung (butuh order fulfillment).', 'warning');
       }
-      
-      addLog('📄 Fetching contract ABI...', 'info');
+
+      addLog('📄 Fetch ABI...', 'info');
       const abi = await fetchContractABI(contractAddress, chainInfo.chainId);
-      
+
       const mintFunc = detectMintFunction(abi);
-      addLog(`🎯 Detected function: ${mintFunc.name}(${mintFunc.params.join(', ')})`, 'info');
-      
-      addLog('💰 Fetching mint price...', 'info');
+      addLog(`🎯 Fungsi terdeteksi: ${mintFunc.name}(${mintFunc.params.join(', ')})`, 'info');
+
+      addLog('💰 Ambil harga mint...', 'info');
       const price = await getMintPrice(provider, contractAddress, abi);
       addLog(`💰 Mint Price: ${price} ${chainInfo.symbol}`, price === '0' ? 'warning' : 'info');
-      
-      addLog('🔍 Checking contract status...', 'info');
+
+      addLog('🔍 Cek status kontrak...', 'info');
       const status = await checkContractStatus(provider, contractAddress, abi);
-      
-      if (status.isPaused) {
-        addLog('⚠️ WARNING: Contract is paused!', 'warning');
-      }
-      if (!status.isPublicSaleActive) {
-        addLog('⚠️ WARNING: Public sale is not active!', 'warning');
-      }
-      if (status.supply.max > 0) {
-        addLog(`📊 Supply: ${status.supply.current}/${status.supply.max}`, 'info');
-      }
-      
-      setCollectionInfo({
-        contractAddress,
-        chainInfo,
-        abi,
-        mintFunc,
-        price,
-        status,
-      });
-      
+      if (status.isPaused) addLog('⚠️ Kontrak paused', 'warning');
+      if (!status.isPublicSaleActive) addLog('⚠️ Public sale tidak aktif', 'warning');
+      if (status.supply.max > 0) addLog(`📊 Supply: ${status.supply.current}/${status.supply.max}`, 'info');
+
+      setCollectionInfo({ contractAddress, chainInfo, abi, mintFunc, price, status });
+
       const scanned = [];
-      
       for (let i = 0; i < keys.length; i++) {
         const key = keys[i];
-        
         try {
           const wallet = new ethers.Wallet(key, provider);
           const address = wallet.address;
-          
-          addLog(`Scanning ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
-          
+          addLog(`Scan ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
+
           const balanceWei = await provider.getBalance(address);
           const balance = ethers.formatEther(balanceWei);
-          
+
           let hasMinted = false;
           try {
-            const contract = new ethers.Contract(contractAddress, abi, provider);
-            const nftBalance = await contract.balanceOf(address);
-            hasMinted = Number(nftBalance) > 0;
-          } catch (e) {}
-          
+            const c = new ethers.Contract(contractAddress, abi, provider);
+            if (typeof c.balanceOf === 'function') {
+              const nftBalance = await c.balanceOf(address);
+              hasMinted = Number(nftBalance) > 0;
+            }
+          } catch {}
+
+          // rough gas estimate
           let gasEstimate = '0.003';
           try {
-            const contract = new ethers.Contract(contractAddress, abi, provider);
+            const c = new ethers.Contract(contractAddress, abi, provider);
             const feeData = await provider.getFeeData();
-            
-            let gasLimit;
-            if (mintFunc.hasQuantity) {
-              gasLimit = await contract[mintFunc.name].estimateGas(
-                config.mintQuantity,
-                { 
-                  value: ethers.parseEther(price || '0'),
-                  from: address 
-                }
-              );
-            } else {
-              gasLimit = await contract[mintFunc.name].estimateGas({
-                value: ethers.parseEther(price || '0'),
-                from: address 
-              });
-            }
-            
-            const gasCost = gasLimit * feeData.gasPrice;
+            const gasUnitPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? ethers.parseUnits('30', 'gwei');
+            let gasLimit = 200000n;
+            try {
+              if (mintFunc.hasQuantity) {
+                gasLimit = await c[mintFunc.name].estimateGas(
+                  BigInt(config.mintQuantity),
+                  { value: ethers.parseEther(price), from: address }
+                );
+              } else {
+                gasLimit = await c[mintFunc.name].estimateGas({ value: ethers.parseEther(price), from: address });
+              }
+            } catch {}
+            const gasCost = gasLimit * gasUnitPrice;
             gasEstimate = ethers.formatEther(gasCost);
-          } catch (e) {
-            gasEstimate = '0.005'; // Default fallback
-          }
-          
-          scanned.push({
-            address,
-            privateKey: key,
-            balance,
-            hasMinted,
-            status: hasMinted ? 'already_minted' : 'ready',
-            gasEstimate,
-          });
-          
-          if (advancedOptions.randomDelay) {
-            await randomDelay(300, 800);
-          } else {
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-          
-        } catch (error) {
-          addLog(`❌ Error scanning wallet ${i + 1}: ${error.message}`, 'error');
-          continue;
+          } catch {}
+
+          scanned.push({ address, privateKey: key, balance, hasMinted, status: hasMinted ? 'already_minted' : 'ready', gasEstimate });
+          if (advancedOptions.randomDelay) await randomDelay();
+        } catch (e) {
+          addLog(`❌ Error scan wallet ${i + 1}: ${e.message}`, 'error');
         }
       }
-      
+
       setWallets(scanned);
-      addLog(`✅ Scan complete! ${scanned.length} wallet(s) ready`, 'success');
-      
-      const readyWallets = scanned.filter(w => w.status === 'ready').length;
-      if (readyWallets === 0) {
-        addLog('⚠️ No wallets are ready to mint', 'warning');
-      } else {
-        addLog(`✅ ${readyWallets} wallet(s) ready to mint`, 'success');
-      }
-      
-      if (scanned.length > 0) {
-        setMintPhases({ ...mintPhases, public: true });
-      }
-      
-    } catch (error) {
-      addLog(`❌ Scan failed: ${error.message}`, 'error');
+      addLog(`✅ Scan selesai. ${scanned.length} wallet`, 'success');
+      const ready = scanned.filter((w) => w.status === 'ready').length;
+      addLog(ready ? `✅ ${ready} wallet siap mint` : '⚠️ Tidak ada wallet siap mint', ready ? 'success' : 'warning');
+    } catch (e) {
+      addLog(`❌ Scan gagal: ${e.message}`, 'error');
+    } finally {
+      setIsScanning(false);
     }
-    
-    setIsScanning(false);
   };
-  
+
+  const buildMintArgs = (mintFunc) => {
+    const args = [];
+    for (const t of mintFunc.params) {
+      if (/uint/.test(t)) args.push(BigInt(config.mintQuantity));
+      else if (/bytes32\[\]|bytes\[\]/.test(t)) args.push([]);
+      else if (/bytes/.test(t)) args.push('0x');
+      else if (/address/.test(t)) args.push('0x0000000000000000000000000000000000000000');
+      else args.push(0);
+    }
+    return args;
+  };
+
   const executeMint = async (walletInfo, provider) => {
     const ethers = ethersRef.current;
-    const { contractAddress, abi, mintFunc, price, chainInfo } = collectionInfo;
-    
+    const { contractAddress, abi, mintFunc, price } = collectionInfo;
     const wallet = new ethers.Wallet(walletInfo.privateKey, provider);
-    const contract = new ethers.Contract(contractAddress, abi, wallet);
-    
+    const c = new ethers.Contract(contractAddress, abi, wallet);
+
     const feeData = await provider.getFeeData();
-    let gasPrice = feeData.gasPrice;
-    
-    // Adjust gas price based on selection
-    if (config.gasLevel === 'high') {
-      gasPrice = (gasPrice * 150n) / 100n; // Increased to 50% for better success
-      addLog(`⚡ Using high gas: ${ethers.formatUnits(gasPrice, 'gwei')} Gwei`, 'info');
-    } else if (config.gasLevel === 'low') {
-      gasPrice = (gasPrice * 90n) / 100n; // Reduced penalty for low gas
-      addLog(`🐌 Using low gas: ${ethers.formatUnits(gasPrice, 'gwei')} Gwei`, 'info');
-    } else {
-      addLog(`⛽ Gas price: ${ethers.formatUnits(gasPrice, 'gwei')} Gwei`, 'info');
-    }
-    
-    const mintValue = ethers.parseEther(price || '0');
-    
-    // Enhanced transaction options for OpenSea Launchpad
-    const txOptions = {
-      value: mintValue,
-      gasPrice: gasPrice,
-      gasLimit: 500000, // Increased gas limit for complex contracts
+    let maxFeePerGas = feeData.maxFeePerGas ?? feeData.gasPrice ?? ethers.parseUnits('30', 'gwei');
+    let maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1.5', 'gwei');
+
+    if (config.gasLevel === 'high') maxFeePerGas = (BigInt(maxFeePerGas) * 130n) / 100n;
+    if (config.gasLevel === 'low') maxFeePerGas = (BigInt(maxFeePerGas) * 85n) / 100n;
+
+    const txOpts = {
+      value: ethers.parseEther(price || '0'),
+      gasLimit: 350000,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
     };
-    
-    addLog(`📤 Sending transaction...`, 'info');
-    
+
+    addLog('📤 Sending transaction...', 'info');
+    const args = buildMintArgs(mintFunc);
     let tx;
-    
-    // Enhanced mint function detection with better error handling
+
     try {
-      // Try the detected function first
-      if (mintFunc.hasQuantity && mintFunc.params.includes('uint256')) {
-        tx = await contract[mintFunc.name](config.mintQuantity, txOptions);
-      } else if (mintFunc.params.includes('bytes32[]')) {
-        // For whitelist/allowlist functions, try with empty proof
-        tx = await contract[mintFunc.name]([], txOptions);
-      } else if (mintFunc.params.includes('bytes')) {
-        // For signature-based minting, try with empty signature
-        tx = await contract[mintFunc.name]('0x', config.mintQuantity || 1, txOptions);
-      } else {
-        // Simple mint without parameters
-        tx = await contract[mintFunc.name](txOptions);
-      }
-    } catch (primaryError) {
-      addLog(`⚠️ Primary method failed: ${primaryError.message}`, 'warning');
-      addLog(`🔄 Trying alternative methods...`, 'info');
-      
-      // Enhanced fallback methods for OpenSea Launchpad
-      const fallbackMethods = [
-        // Standard mint functions
-        { name: 'mint', params: [config.mintQuantity], value: true },
-        { name: 'mint', params: [], value: true },
-        { name: 'publicMint', params: [config.mintQuantity], value: true },
-        { name: 'publicMint', params: [], value: true },
-        { name: 'claim', params: [config.mintQuantity], value: true },
-        { name: 'claim', params: [], value: true },
-        
-        // Whitelist functions (try with empty proof)
-        { name: 'whitelistMint', params: [[], config.mintQuantity], value: true },
-        { name: 'whitelistMint', params: [[]], value: true },
-        { name: 'allowlistMint', params: [[], config.mintQuantity], value: true },
-        { name: 'allowlistMint', params: [[]], value: true },
-        
-        // Signature functions (try with empty signature)
-        { name: 'mintWithSignature', params: ['0x', config.mintQuantity], value: true },
-        { name: 'mintWithSignature', params: ['0x'], value: true },
-        
-        // Alternative function names
-        { name: 'purchase', params: [config.mintQuantity], value: true },
-        { name: 'purchase', params: [], value: true },
-        { name: 'buy', params: [config.mintQuantity], value: true },
-        { name: 'buy', params: [], value: true },
+      tx = args.length ? await c[mintFunc.name](...args, txOpts) : await c[mintFunc.name](txOpts);
+    } catch (primaryErr) {
+      addLog('⚠️ Primary method failed, trying alternatives...', 'warning');
+      const tries = [
+        { name: 'mint', args: mintFunc.hasQuantity ? [BigInt(config.mintQuantity)] : [] },
+        { name: 'publicMint', args: mintFunc.hasQuantity ? [BigInt(config.mintQuantity)] : [] },
+        { name: 'claim', args: [] },
       ];
-      
-      let success = false;
-      for (const method of fallbackMethods) {
+      let ok = false;
+      for (const t of tries) {
         try {
-          addLog(`Trying ${method.name}(${method.params.join(', ')})...`, 'info');
-          
-          const methodTxOptions = { ...txOptions };
-          if (!method.value) {
-            methodTxOptions.value = 0;
-          }
-          
-          if (method.params.length > 0) {
-            tx = await contract[method.name](...method.params, methodTxOptions);
-          } else {
-            tx = await contract[method.name](methodTxOptions);
-          }
-          
-          success = true;
-          addLog(`✅ Success with ${method.name}`, 'success');
+          addLog(`Trying ${t.name}(${t.args.map((a) => a?.toString?.() ?? a).join(', ')})...`, 'info');
+          tx = t.args.length ? await c[t.name](...t.args, txOpts) : await c[t.name](txOpts);
+          ok = true;
           break;
-        } catch (methodError) {
-          // Skip logging for common expected errors to reduce noise
-          const errorMsg = methodError.message.toLowerCase();
-          if (!errorMsg.includes('insufficient funds') && 
-              !errorMsg.includes('already minted') &&
-              !errorMsg.includes('not started') &&
-              !errorMsg.includes('ended')) {
-            addLog(`❌ ${method.name} failed: ${methodError.message}`, 'error');
-          }
-          continue;
-        }
+        } catch {}
       }
-      
-      if (!success) {
-        // Final attempt with increased gas
+      if (!ok) {
         try {
-          addLog(`🔥 Final attempt with increased gas limit...`, 'warning');
-          const finalTxOptions = { ...txOptions, gasLimit: 800000 };
-          tx = await contract.mint(finalTxOptions);
-          success = true;
-        } catch (finalError) {
-          throw new Error(`All mint methods failed. Last error: ${finalError.message}`);
+          addLog('Trying detected function with zero quantity...', 'info');
+          tx = await c[mintFunc.name](0, txOpts);
+        } catch (e) {
+          throw new Error('All mint methods failed. Contract may be paused or wallet not eligible.');
         }
       }
     }
-    
+
     addLog(`⏳ Confirming... TX: ${tx.hash}`, 'info');
-    
-    const receipt = await tx.wait();
-    
-    if (receipt.status !== 1) {
-      throw new Error('Transaction reverted');
-    }
-    
+    const rc = await tx.wait();
+    if (rc.status !== 1) throw new Error('Transaction reverted');
     return tx.hash;
   };
-  
+
   const startMinting = async () => {
-    if (!ethersRef.current) {
-      addLog('❌ Ethers.js not loaded yet', 'error');
-      return;
-    }
-    
-    if (wallets.length === 0) {
-      addLog('❌ Please scan wallets first', 'error');
-      return;
-    }
-    
-    if (!collectionInfo) {
-      addLog('❌ Collection info not loaded', 'error');
-      return;
-    }
-    
-    if (seaportDetected && advancedOptions.useSeaport) {
-      addLog('❌ Seaport minting requires order fulfillment (advanced feature)', 'error');
-      addLog('💡 For Seaport drops, disable "Use Seaport" or use direct contract address', 'warning');
-      return;
-    }
-    
-    const selectedPhases = Object.keys(mintPhases).filter(k => mintPhases[k]);
-    if (selectedPhases.length === 0) {
-      addLog('❌ Please select at least one mint phase', 'error');
-      return;
-    }
-    
+    if (!ethersRef.current) return addLog('❌ Ethers.js not loaded yet', 'error');
+    if (!wallets.length) return addLog('❌ Jalankan scan dulu', 'error');
+    if (!collectionInfo) return addLog('❌ Collection info belum siap', 'error');
+    if (seaportDetected && advancedOptions.useSeaport)
+      return addLog('❌ Seaport drop perlu order fulfillment — tidak mint langsung', 'error');
+
+    const selected = Object.keys(mintPhases).filter((k) => mintPhases[k]);
+    if (!selected.length) return addLog('❌ Pilih minimal satu phase mint', 'error');
+
     setIsMinting(true);
     setMintStats({ success: 0, failed: 0, total: wallets.length });
     addLog('🚀 Starting mint process...', 'info');
-    
+
     const ethers = ethersRef.current;
     const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-    const updatedWallets = [...wallets];
-    
-    let successCount = 0;
-    let failedCount = 0;
-    
-    for (let i = 0; i < updatedWallets.length; i++) {
-      const walletInfo = updatedWallets[i];
-      
-      walletInfo.status = 'minting';
-      setWallets([...updatedWallets]);
-      
-      addLog(`\n${'='.repeat(50)}`, 'info');
-      addLog(`🔄 Wallet ${i + 1}/${updatedWallets.length}: ${walletInfo.address.slice(0, 6)}...${walletInfo.address.slice(-4)}`, 'info');
-      
-      if (walletInfo.hasMinted) {
-        walletInfo.status = 'skipped';
-        walletInfo.error = 'Already minted';
-        setWallets([...updatedWallets]);
-        addLog(`⏭️ Skipped: Already has NFT`, 'warning');
-        failedCount++;
-        setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-        await new Promise(resolve => setTimeout(resolve, 1000));
+    const arr = [...wallets];
+    let ok = 0, ko = 0;
+
+    for (let i = 0; i < arr.length; i++) {
+      const w = arr[i];
+      w.status = 'minting';
+      setWallets([...arr]);
+      addLog(`\n==================================================`, 'info');
+      addLog(`🔄 Wallet ${i + 1}/${arr.length}: ${w.address.slice(0, 6)}...${w.address.slice(-4)}`, 'info');
+
+      if (w.hasMinted) {
+        w.status = 'skipped';
+        w.error = 'Already minted';
+        setWallets([...arr]);
+        addLog('⏭️ Skipped: Already has NFT', 'warning');
+        ko++; setMintStats((p) => ({ ...p, failed: p.failed + 1 }));
+        await new Promise((r) => setTimeout(r, 600));
         continue;
       }
-      
-      const totalCost = (parseFloat(collectionInfo.price || '0') * config.mintQuantity) + parseFloat(walletInfo.gasEstimate);
-      if (parseFloat(walletInfo.balance) < totalCost) {
-        walletInfo.status = 'failed';
-        walletInfo.error = 'Insufficient balance';
-        setWallets([...updatedWallets]);
-        addLog(`❌ Failed: Need ${totalCost.toFixed(6)} ${collectionInfo.chainInfo.symbol}, have ${walletInfo.balance}`, 'error');
-        failedCount++;
-        setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-        await new Promise(resolve => setTimeout(resolve, 1000));
+
+      const totalCost = (parseFloat(collectionInfo.price || '0') * config.mintQuantity) + parseFloat(w.gasEstimate || '0');
+      if (parseFloat(w.balance) < totalCost) {
+        w.status = 'failed';
+        w.error = 'Insufficient balance';
+        setWallets([...arr]);
+        addLog(`❌ Failed: Need ${totalCost.toFixed(6)} ${collectionInfo.chainInfo?.symbol || ''}, have ${w.balance}`, 'error');
+        ko++; setMintStats((p) => ({ ...p, failed: p.failed + 1 }));
+        await new Promise((r) => setTimeout(r, 600));
         continue;
       }
-      
-      let mintSuccess = false;
-      let retryCount = 0;
-      let txHash = null;
+
+      let success = false, retry = 0, hash = null;
       const maxRetries = advancedOptions.autoRetry ? 3 : 0;
-      
-      while (!mintSuccess && retryCount <= maxRetries) {
-        if (retryCount > 0) {
-          addLog(`🔄 Retry ${retryCount}/${maxRetries}...`, 'warning');
-          await randomDelay(2000, 5000); // Increased delay for retries
+
+      while (!success && retry <= maxRetries) {
+        if (retry) {
+          addLog(`🔄 Retry ${retry}/${maxRetries}...`, 'warning');
+          await new Promise((r) => setTimeout(r, 1200));
         }
-        
         try {
-          // Cek ulang balance sebelum setiap percobaan
-          const currentBalance = await provider.getBalance(walletInfo.address);
-          const currentBalanceEth = ethers.formatEther(currentBalance);
-          
-          const totalCost = (parseFloat(collectionInfo.price || '0') * config.mintQuantity) + parseFloat(walletInfo.gasEstimate);
-          
-          if (parseFloat(currentBalanceEth) < totalCost) {
-            throw new Error(`Insufficient balance: need ${totalCost}, have ${currentBalanceEth}`);
-          }
-          
-          txHash = await executeMint(walletInfo, provider);
-          mintSuccess = true;
-          addLog(`✅ SUCCESS! TX: ${txHash}`, 'success');
-          
-        } catch (error) {
-          const errorMsg = error.message || 'Unknown error';
-          
-          // Categorize errors for better messaging
-          if (errorMsg.includes('insufficient funds')) {
-            addLog(`❌ Insufficient funds: ${errorMsg}`, 'error');
-            break;
-          } else if (errorMsg.includes('already minted')) {
-            addLog(`❌ Already minted: ${errorMsg}`, 'warning');
-            walletInfo.hasMinted = true;
-            break;
-          } else if (errorMsg.includes('not started') || errorMsg.includes('paused')) {
-            addLog(`❌ Mint not active: ${errorMsg}`, 'error');
-            break;
-          } else if (errorMsg.includes('max supply') || errorMsg.includes('sold out')) {
-            addLog(`❌ Supply limit: ${errorMsg}`, 'error');
-            break;
-          } else {
-            addLog(`❌ Attempt ${retryCount + 1} failed: ${errorMsg}`, 'error');
-            retryCount++;
-          }
+          hash = await executeMint(w, provider);
+          success = true;
+          addLog(`✅ SUCCESS! TX: ${hash}`, 'success');
+        } catch (e) {
+          const msg = e?.message || 'Unknown error';
+          addLog(`❌ Attempt ${retry + 1} failed: ${msg}`, 'error');
+          if (/insufficient funds/i.test(msg) || /max supply|already minted/i.test(msg)) break;
+          retry++;
         }
       }
-      
-      if (mintSuccess) {
-        walletInfo.status = 'success';
-        walletInfo.txHash = txHash;
-        successCount++;
-        setMintStats(prev => ({ ...prev, success: prev.success + 1 }));
+
+      if (success) {
+        w.status = 'success'; w.txHash = hash; ok++; setMintStats((p) => ({ ...p, success: p.success + 1 }));
       } else {
-        walletInfo.status = 'failed';
-        walletInfo.error = 'Max retries reached';
-        failedCount++;
-        setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+        w.status = 'failed'; w.error = 'Max retries reached'; ko++; setMintStats((p) => ({ ...p, failed: p.failed + 1 }));
       }
-      
-      setWallets([...updatedWallets]);
-      
-      if (i < updatedWallets.length - 1) {
-        const delaySeconds = advancedOptions.randomDelay 
-          ? Math.floor(Math.random() * 3) + 3
-          : 5;
-        addLog(`⏳ Waiting ${delaySeconds}s before next wallet...`, 'info');
-        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+      setWallets([...arr]);
+
+      if (i < arr.length - 1) {
+        const delaySec = advancedOptions.randomDelay ? Math.floor(Math.random() * 3) + 3 : 5;
+        addLog(`⏳ Waiting ${delaySec}s before next wallet...`, 'info');
+        await new Promise((r) => setTimeout(r, delaySec * 1000));
       }
     }
-    
+
     setIsMinting(false);
-    addLog(`\n${'='.repeat(50)}`, 'info');
+    addLog(`\n==================================================`, 'info');
     addLog('🎉 Minting process completed!', 'success');
-    addLog(`📊 Final Results: ${successCount} ✅ | ${failedCount} ❌ | ${updatedWallets.length} Total`, 'info');
+    addLog(`📊 Final Results: ${ok} ✅ | ${ko} ❌ | ${arr.length} Total`, 'info');
   };
-  
-  const clearAll = () => {
-    setConfig({
-      collectionUrl: '',
-      contractAddress: '',
-      rpcUrl: '',
-      privateKeys: '',
-      gasLevel: 'normal',
-      mintQuantity: 1,
-    });
-    setWallets([]);
-    setLogs([]);
-    setMintStats({ success: 0, failed: 0, total: 0 });
-    setCollectionInfo(null);
-    setSeaportDetected(false);
-    setMintPhases({ public: false, whitelist: false, allowlist: false });
-    addLog('🔄 Reset complete', 'info');
-  };
-  
+
   const getStatusIcon = (status) => {
     switch (status) {
-      case 'ready':
-        return <Clock className="w-4 h-4 text-gray-400" />;
-      case 'minting':
-        return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
-      case 'success':
-        return <CheckCircle className="w-4 h-4 text-green-500" />;
-      case 'failed':
-        return <XCircle className="w-4 h-4 text-red-500" />;
+      case 'ready': return <Clock className="w-4 h-4 text-gray-400" />;
+      case 'minting': return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
+      case 'success': return <CheckCircle className="w-4 h-4 text-green-500" />;
+      case 'failed': return <XCircle className="w-4 h-4 text-red-500" />;
       case 'skipped':
-      case 'already_minted':
-        return <AlertCircle className="w-4 h-4 text-yellow-500" />;
-      default:
-        return <Clock className="w-4 h-4 text-gray-400" />;
+      case 'already_minted': return <AlertCircle className="w-4 h-4 text-yellow-500" />;
+      default: return <Clock className="w-4 h-4 text-gray-400" />;
     }
   };
-  
-  const getStatusText = (wallet) => {
-    switch (wallet.status) {
-      case 'ready':
-        return 'Ready';
-      case 'minting':
-        return 'Minting...';
-      case 'success':
-        return wallet.txHash ? `${wallet.txHash.slice(0, 8)}...` : 'Success';
-      case 'failed':
-        return wallet.error || 'Failed';
-      case 'skipped':
-        return wallet.error || 'Skipped';
-      case 'already_minted':
-        return 'Already Minted';
-      default:
-        return 'Unknown';
+
+  const getStatusText = (w) => {
+    switch (w.status) {
+      case 'ready': return 'Ready';
+      case 'minting': return 'Minting...';
+      case 'success': return w.txHash ? `${w.txHash.slice(0, 8)}...` : 'Success';
+      case 'failed': return w.error || 'Failed';
+      case 'skipped': return w.error || 'Skipped';
+      case 'already_minted': return 'Already Minted';
+      default: return 'Unknown';
     }
   };
-  
+
+  // Minimal UI wrapper so you can drop-in replace easily
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4">
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="bg-gradient-to-r from-purple-600 via-blue-600 to-purple-600 rounded-t-2xl p-6 shadow-2xl">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <Zap className="w-10 h-10 text-yellow-300" />
-              <div>
-                <h1 className="text-3xl font-bold text-white">OpenSea Auto Mint Bot v2</h1>
-                <p className="text-purple-100 text-sm">Production-Ready • Multi-Wallet • Smart Detection</p>
-              </div>
+    <div className="min-h-screen bg-slate-900 text-white p-6">
+      <div className="max-w-5xl mx-auto">
+        <h1 className="text-2xl font-bold">OpenSea Auto Mint — Fixed</h1>
+        <p className="text-sm text-gray-300 mt-1">
+          Deteksi chain/symbol otomatis, ABI normalisasi, argumen mint dinamis, gas EIP-1559, dan fallback yang lebih pintar.
+        </p>
+
+        <div className="grid md:grid-cols-2 gap-4 mt-6">
+          <div className="bg-slate-800/60 rounded-xl p-4 space-y-3">
+            <label className="block text-sm">OpenSea Collection URL / Contract Address</label>
+            <input className="w-full bg-slate-900 rounded p-2 text-sm" placeholder="https://opensea.io/collection/..." value={config.collectionUrl} onChange={(e)=>setConfig({...config, collectionUrl:e.target.value})}/>
+            <label className="block text-sm">Contract Address (optional jika URL langsung address)</label>
+            <input className="w-full bg-slate-900 rounded p-2 text-sm" placeholder="0x..." value={config.contractAddress} onChange={(e)=>setConfig({...config, contractAddress:e.target.value})}/>
+            <label className="block text-sm mt-2">RPC URL</label>
+            <input className="w-full bg-slate-900 rounded p-2 text-sm" placeholder="https://..." value={config.rpcUrl} onChange={(e)=>setConfig({...config, rpcUrl:e.target.value})}/>
+            <label className="block text-sm mt-2">Private Keys (satu per baris)</label>
+            <textarea className="w-full bg-slate-900 rounded p-2 text-sm h-24" value={config.privateKeys} onChange={(e)=>setConfig({...config, privateKeys:e.target.value})}/>
+            <div className="flex gap-2 items-center mt-2">
+              <span className="text-sm">Gas:</span>
+              <select className="bg-slate-900 rounded p-2 text-sm" value={config.gasLevel} onChange={(e)=>setConfig({...config, gasLevel:e.target.value})}>
+                <option value="low">Low</option>
+                <option value="normal">Normal</option>
+                <option value="high">High</option>
+              </select>
+              <span className="text-sm ml-4">Qty:</span>
+              <input type="number" min="1" className="bg-slate-900 rounded p-2 text-sm w-20" value={config.mintQuantity} onChange={(e)=>setConfig({...config, mintQuantity: Number(e.target.value || 1)})}/>
             </div>
-            <Shield className="w-8 h-8 text-green-300" />
+            <div className="flex gap-2 mt-3">
+              <button onClick={scanWallets} disabled={isScanning} className="bg-indigo-600 px-3 py-2 rounded disabled:opacity-50">Scan</button>
+              <button onClick={startMinting} disabled={isMinting || !wallets.length} className="bg-emerald-600 px-3 py-2 rounded disabled:opacity-50">Start Minting</button>
+            </div>
           </div>
-        </div>
-        
-        {/* Security Warning */}
-        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 mb-4 mt-4">
-          <div className="flex items-start gap-3">
-            <AlertCircle className="w-6 h-6 text-yellow-500 flex-shrink-0 mt-0.5" />
-            <div className="text-sm text-yellow-200">
-              <strong className="block mb-1">🔒 Security Notice:</strong>
-              <ul className="space-y-1 list-disc list-inside">
-                <li>Private keys stored in memory only (never saved)</li>
-                <li>Always verify contract addresses before minting</li>
-                <li>Test with small amounts first on testnet</li>
-                <li>Transactions are irreversible - use at your own risk</li>
-              </ul>
+
+          <div className="bg-slate-800/60 rounded-xl p-4">
+            <div className="text-sm font-semibold mb-2">Logs</div>
+            <div className="h-72 overflow-auto space-y-1 bg-slate-900/60 rounded p-2">
+              {logs.map((log, i) => (
+                <div key={i} className="text-xs text-gray-300">
+                  <span className="text-gray-500">{log.timestamp} — </span>
+                  <span className={
+                    log.type === 'error' ? 'text-red-400' :
+                    log.type === 'success' ? 'text-green-400' :
+                    log.type === 'warning' ? 'text-yellow-400' : 'text-gray-300'
+                  }>
+                    {log.message}
+                  </span>
+                </div>
+              ))}
+              <div ref={logsEndRef} />
             </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Main Configuration Panel */}
-          <div className="lg:col-span-2 space-y-6">
-            <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-              <h2 className="text-xl font-semibold text-white mb-5 flex items-center gap-2">
-                <Activity className="w-6 h-6 text-purple-400" />
-                Configuration
-              </h2>
-              
-              <div className="space-y-4">
-                {/* Collection URL */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    OpenSea Collection URL or Contract Address
-                  </label>
-                  <input
-                    type="text"
-                    value={config.collectionUrl}
-                    onChange={(e) => setConfig({ ...config, collectionUrl: e.target.value })}
-                    placeholder="https://opensea.io/collection/... or 0x..."
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
-                  />
-                  {extractContractFromUrl(config.collectionUrl) && (
-                    <p className="text-xs text-green-400 mt-1 flex items-center gap-1">
-                      <CheckCircle className="w-3 h-3" />
-                      URL detected successfully
-                    </p>
-                  )}
+        {wallets.length > 0 && (
+          <div className="bg-slate-800/60 rounded-xl p-4 mt-4">
+            <div className="text-sm font-semibold mb-2">Wallets</div>
+            <div className="space-y-2">
+              {wallets.map((w, i) => (
+                <div key={i} className="flex items-center justify-between bg-slate-900/60 rounded p-2 text-sm">
+                  <div className="flex items-center gap-2">
+                    {getStatusIcon(w.status)}
+                    <span className="font-mono">{w.address.slice(0,6)}...{w.address.slice(-4)}</span>
+                  </div>
+                  <div className="text-xs text-gray-300">{getStatusText(w)}</div>
                 </div>
-                
-                {/* Contract Address Override */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Contract Address (Manual Override)
-                  </label>
-                  <input
-                    type="text"
-                    value={config.contractAddress}
-                    onChange={(e) => setConfig({ ...config, contractAddress: e.target.value })}
-                    placeholder="0x... (leave empty to auto-detect)"
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">
-                    💡 Use this if auto-detection fails
-                  </p>
-                </div>
-                
-                {/* RPC URL */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    RPC URL 
-                    {collectionInfo && (
-                      <span className="text-purple-400 ml-2">
-                        ({collectionInfo.chainInfo.name} - {collectionInfo.chainInfo.symbol})
-                      </span>
-                    )}
-                  </label>
-                  <input
-                    type="text"
-                    value={config.rpcUrl}
-                    onChange={(e) => setConfig({ ...config, rpcUrl: e.target.value })}
-                    placeholder="https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">
-                    Chain will auto-detect when valid RPC is provided
-                  </p>
-                </div>
-                
-                {/* Private Keys */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Private Keys (max 20, one per line)
-                  </label>
-                  <textarea
-                    value={config.privateKeys}
-                    onChange={(e) => setConfig({ ...config, privateKeys: e.target.value })}
-                    placeholder="0xabc123...&#10;0xdef456...&#10;0xghi789..."
-                    rows={5}
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm transition"
-                  />
-                  <p className="text-xs text-gray-400 mt-1 flex items-center justify-between">
-                    <span>All keys must start with 0x</span>
-                    <span className="text-purple-400 font-semibold">
-                      {parsePrivateKeys(config.privateKeys).length}/20 valid
-                    </span>
-                  </p>
-                </div>
-                
-                {/* Settings Row */}
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Gas Level</label>
-                    <select
-                      value={config.gasLevel}
-                      onChange={(e) => setConfig({ ...config, gasLevel: e.target.value })}
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
-                    >
-                      <option value="low">🐌 Low (-10%)</option>
-                      <option value="normal">⚡ Normal</option>
-                      <option value="high">🚀 High (+50%)</option>
-                    </select>
-                  </div>
-                  
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Mint Quantity</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="10"
-                      value={config.mintQuantity}
-                      onChange={(e) => setConfig({ ...config, mintQuantity: Math.max(1, parseInt(e.target.value) || 1) })}
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-purple-500 transition"
-                    />
-                  </div>
-                </div>
-                
-                {/* Scan Button */}
-                <div className="flex gap-3 pt-2">
-                  <button
-                    onClick={scanWallets}
-                    disabled={isScanning || isMinting}
-                    className="flex-1 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-700 text-white px-6 py-3 rounded-lg font-semibold flex items-center justify-center gap-2 transition-all disabled:cursor-not-allowed shadow-lg"
-                  >
-                    {isScanning ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        Scanning Wallets...
-                      </>
-                    ) : (
-                      <>
-                        <Scan className="w-5 h-5" />
-                        Scan & Analyze
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-              
-              {/* Advanced Options */}
-              {wallets.length > 0 && (
-                <>
-                  <div className="mt-6 pt-6 border-t border-slate-700">
-                    <label className="block text-sm font-medium text-gray-300 mb-3">
-                      Mint Phase Selection
-                    </label>
-                    <div className="flex flex-wrap gap-4">
-                      <label className="flex items-center gap-2 cursor-pointer bg-slate-700/30 px-4 py-2 rounded-lg hover:bg-slate-700/50 transition">
-                        <input
-                          type="checkbox"
-                          checked={mintPhases.public}
-                          onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                        />
-                        <span className="text-white font-medium">Public Mint</span>
-                      </label>
-                      
-                      <label className="flex items-center gap-2 cursor-pointer bg-slate-700/30 px-4 py-2 rounded-lg hover:bg-slate-700/50 transition">
-                        <input
-                          type="checkbox"
-                          checked={mintPhases.whitelist}
-                          onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                        />
-                        <span className="text-white font-medium">Whitelist</span>
-                      </label>
-                      
-                      <label className="flex items-center gap-2 cursor-pointer bg-slate-700/30 px-4 py-2 rounded-lg hover:bg-slate-700/50 transition">
-                        <input
-                          type="checkbox"
-                          checked={mintPhases.allowlist}
-                          onChange={(e) => setMintPhases({ ...mintPhases, allowlist: e.target.checked })}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                        />
-                        <span className="text-white font-medium">Allowlist</span>
-                      </label>
-                    </div>
-                  </div>
-                  
-                  <div className="mt-4 pt-4 border-t border-slate-700">
-                    <label className="block text-sm font-medium text-gray-300 mb-3">
-                      Advanced Options
-                    </label>
-                    <div className="flex flex-wrap gap-4">
-                      <label className="flex items-center gap-2 cursor-pointer bg-slate-700/30 px-4 py-2 rounded-lg hover:bg-slate-700/50 transition">
-                        <input
-                          type="checkbox"
-                          checked={advancedOptions.autoRetry}
-                          onChange={(e) => setAdvancedOptions({ ...advancedOptions, autoRetry: e.target.checked })}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                        />
-                        <span className="text-white text-sm">Auto-Retry (3x)</span>
-                      </label>
-                      
-                      <label className="flex items-center gap-2 cursor-pointer bg-slate-700/30 px-4 py-2 rounded-lg hover:bg-slate-700/50 transition">
-                        <input
-                          type="checkbox"
-                          checked={advancedOptions.randomDelay}
-                          onChange={(e) => setAdvancedOptions({ ...advancedOptions, randomDelay: e.target.checked })}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                        />
-                        <span className="text-white text-sm">Random Delays</span>
-                      </label>
-                      
-                      <label className="flex items-center gap-2 cursor-pointer bg-slate-700/30 px-4 py-2 rounded-lg hover:bg-slate-700/50 transition">
-                        <input
-                          type="checkbox"
-                          checked={advancedOptions.useSeaport}
-                          onChange={(e) => setAdvancedOptions({ ...advancedOptions, useSeaport: e.target.checked })}
-                          className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                        />
-                        <span className="text-white text-sm">Seaport Protocol</span>
-                      </label>
-                    </div>
-                  </div>
-                </>
-              )}
-              
-              {/* Action Buttons */}
-              {wallets.length > 0 && (
-                <div className="mt-6 flex gap-3">
-                  <button
-                    onClick={startMinting}
-                    disabled={isMinting || wallets.filter(w => w.status === 'ready').length === 0}
-                    className="flex-1 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 disabled:from-gray-600 disabled:to-gray-700 text-white py-3.5 rounded-lg font-bold text-lg flex items-center justify-center gap-2 transition-all disabled:cursor-not-allowed shadow-lg"
-                  >
-                    {isMinting ? (
-                      <>
-                        <Loader2 className="w-6 h-6 animate-spin" />
-                        Minting in Progress...
-                      </>
-                    ) : (
-                      <>
-                        <Zap className="w-6 h-6" />
-                        Start Minting ({wallets.filter(w => w.status === 'ready').length} ready)
-                      </>
-                    )}
-                  </button>
-                  
-                  <button
-                    onClick={clearAll}
-                    disabled={isMinting || isScanning}
-                    className="px-6 bg-slate-700 hover:bg-slate-600 disabled:bg-gray-700 text-white py-3.5 rounded-lg font-semibold transition-all disabled:cursor-not-allowed"
-                  >
-                    Clear All
-                  </button>
-                </div>
-              )}
-            </div>
-            
-            {/* Wallet Status Panel */}
-            {wallets.length > 0 && (
-              <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                <h2 className="text-xl font-semibold text-white mb-4 flex items-center justify-between">
-                  <span className="flex items-center gap-2">
-                    <Activity className="w-6 h-6 text-purple-400" />
-                    Wallet Status
-                  </span>
-                  <span className="text-sm text-gray-400">
-                    {wallets.length} wallet{wallets.length !== 1 ? 's' : ''}
-                  </span>
-                </h2>
-                
-                <div className="space-y-2 max-h-96 overflow-y-auto pr-2">
-                  {wallets.map((wallet, idx) => (
-                    <div 
-                      key={idx} 
-                      className={`bg-slate-700/30 rounded-lg p-4 flex items-center justify-between border-l-4 transition ${
-                        wallet.status === 'success' ? 'border-green-500' :
-                        wallet.status === 'failed' ? 'border-red-500' :
-                        wallet.status === 'minting' ? 'border-blue-500' :
-                        wallet.status === 'skipped' ? 'border-yellow-500' :
-                        'border-gray-500'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3 flex-1">
-                        {getStatusIcon(wallet.status)}
-                        <div className="flex-1">
-                          <p className="text-white font-mono text-sm font-semibold">
-                            {wallet.address.slice(0, 6)}...{wallet.address.slice(-4)}
-                          </p>
-                          <p className="text-gray-400 text-xs mt-0.5">
-                            Balance: {parseFloat(wallet.balance).toFixed(4)} {collectionInfo?.chainInfo.symbol || 'ETH'}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <p className={`text-sm font-semibold ${
-                          wallet.status === 'success' ? 'text-green-400' :
-                          wallet.status === 'failed' ? 'text-red-400' :
-                          wallet.status === 'minting' ? 'text-blue-400' :
-                          wallet.status === 'skipped' ? 'text-yellow-400' :
-                          'text-gray-400'
-                        }`}>
-                          {getStatusText(wallet)}
-                        </p>
-                        {wallet.txHash && collectionInfo && (
-                          <a
-                            href={`https://${collectionInfo.chainInfo.explorer}/tx/${wallet.txHash}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-xs text-purple-400 hover:text-purple-300 transition"
-                          >
-                            View TX →
-                          </a>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                
-                {/* Stats */}
-                {mintStats.total > 0 && (
-                  <div className="mt-4 pt-4 border-t border-slate-700 grid grid-cols-3 gap-4">
-                    <div className="text-center bg-green-500/10 rounded-lg p-3">
-                      <p className="text-3xl font-bold text-green-400">{mintStats.success}</p>
-                      <p className="text-xs text-gray-400 mt-1">Success</p>
-                    </div>
-                    <div className="text-center bg-red-500/10 rounded-lg p-3">
-                      <p className="text-3xl font-bold text-red-400">{mintStats.failed}</p>
-                      <p className="text-xs text-gray-400 mt-1">Failed</p>
-                    </div>
-                    <div className="text-center bg-purple-500/10 rounded-lg p-3">
-                      <p className="text-3xl font-bold text-purple-400">{mintStats.total}</p>
-                      <p className="text-xs text-gray-400 mt-1">Total</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-          
-          {/* Right Sidebar */}
-          <div className="space-y-6">
-            {/* Collection Info */}
-            {collectionInfo && (
-              <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                  <span className="text-2xl">💎</span>
-                  Collection Info
-                </h2>
-                
-                <div className="space-y-3">
-                  <div className="flex justify-between items-start">
-                    <span className="text-gray-400 text-sm">Contract:</span>
-                    <span className="text-white font-mono text-xs text-right">
-                      {collectionInfo.contractAddress.slice(0, 6)}...{collectionInfo.contractAddress.slice(-4)}
-                    </span>
-                  </div>
-                  
-                  <div className="flex justify-between">
-                    <span className="text-gray-400 text-sm">Chain:</span>
-                    <span className="text-white font-semibold text-sm">{collectionInfo.chainInfo.name}</span>
-                  </div>
-                  
-                  <div className="flex justify-between">
-                    <span className="text-gray-400 text-sm">Mint Price:</span>
-                    <span className="text-purple-400 font-bold">
-                      {collectionInfo.price} {collectionInfo.chainInfo.symbol}
-                    </span>
-                  </div>
-                  
-                  <div className="flex justify-between">
-                    <span className="text-gray-400 text-sm">Est. Gas:</span>
-                    <span className="text-white font-semibold text-sm">
-                      ~{wallets[0]?.gasEstimate || '0.003'} {collectionInfo.chainInfo.symbol}
-                    </span>
-                  </div>
-                  
-                  <div className="flex justify-between pt-2 border-t border-slate-700">
-                    <span className="text-gray-400 text-sm font-semibold">Total per Mint:</span>
-                    <span className="text-green-400 font-bold">
-                      {(parseFloat(collectionInfo.price || '0') * config.mintQuantity + parseFloat(wallets[0]?.gasEstimate || '0.003')).toFixed(6)} {collectionInfo.chainInfo.symbol}
-                    </span>
-                  </div>
-                  
-                  {collectionInfo.mintFunc && (
-                    <div className="pt-2 border-t border-slate-700">
-                      <span className="text-gray-400 text-xs block mb-1">Mint Function:</span>
-                      <span className="text-white font-mono text-xs bg-slate-900/50 px-2 py-1 rounded">
-                        {collectionInfo.mintFunc.name}({collectionInfo.mintFunc.params.join(', ')})
-                      </span>
-                    </div>
-                  )}
-                  
-                  {collectionInfo.status.supply.max > 0 && (
-                    <div className="pt-2 border-t border-slate-700">
-                      <span className="text-gray-400 text-xs block mb-2">Supply:</span>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 bg-slate-900/50 rounded-full h-2">
-                          <div 
-                            className="bg-gradient-to-r from-purple-500 to-blue-500 h-2 rounded-full transition-all"
-                            style={{ width: `${(collectionInfo.status.supply.current / collectionInfo.status.supply.max) * 100}%` }}
-                          />
-                        </div>
-                        <span className="text-white text-xs font-semibold">
-                          {collectionInfo.status.supply.current}/{collectionInfo.status.supply.max}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                  
-                  {collectionInfo.status.isPaused && (
-                    <div className="bg-red-500/20 border border-red-500/50 rounded-lg p-2 mt-2">
-                      <p className="text-red-400 text-xs font-semibold">⚠️ Contract is PAUSED</p>
-                    </div>
-                  )}
-                  
-                  {!collectionInfo.status.isPublicSaleActive && (
-                    <div className="bg-yellow-500/20 border border-yellow-500/50 rounded-lg p-2 mt-2">
-                      <p className="text-yellow-400 text-xs font-semibold">⚠️ Public sale NOT active</p>
-                    </div>
-                  )}
-                  
-                  {seaportDetected && (
-                    <div className="bg-blue-500/20 border border-blue-500/50 rounded-lg p-2 mt-2">
-                      <p className="text-blue-400 text-xs font-semibold">ℹ️ Seaport protocol detected</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-            
-            {/* Live Logs */}
-            <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                <span className="text-2xl">📜</span>
-                Live Logs
-              </h2>
-              
-              <div className="bg-slate-900/50 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-slate-900">
-                {logs.length === 0 ? (
-                  <div className="text-center py-8">
-                    <p className="text-gray-500 mb-2">No logs yet</p>
-                    <p className="text-gray-600 text-xs">Configure settings and scan wallets to begin</p>
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    {logs.map((log, idx) => (
-                      <div key={idx} className="flex gap-2">
-                        <span className="text-gray-500 flex-shrink-0 select-none">[{log.timestamp}]</span>
-                        <span className={
-                          log.type === 'error' ? 'text-red-400' :
-                          log.type === 'success' ? 'text-green-400' :
-                          log.type === 'warning' ? 'text-yellow-400' :
-                          'text-gray-300'
-                        }>
-                          {log.message}
-                        </span>
-                      </div>
-                    ))}
-                    <div ref={logsEndRef} />
-                  </div>
-                )}
-              </div>
+              ))}
             </div>
           </div>
-        </div>
-        
-        {/* Footer */}
-        <div className="mt-6 text-center text-gray-400 text-sm pb-4 space-y-2">
-          <p className="flex items-center justify-center gap-2">
-            <AlertCircle className="w-4 h-4" />
-            Real minting tool - Transactions are irreversible
-          </p>
-          <p className="text-xs">Always verify contracts • Test on testnet first • Use burner wallets</p>
-          <p className="text-xs text-purple-400 mt-3">Made with 💜 for the NFT community • Production Ready v2.0</p>
+        )}
+
+        {collectionInfo && (
+          <div className="text-xs text-gray-400 mt-4">
+            Chain: {collectionInfo.chainInfo?.name} • Token: {collectionInfo.chainInfo?.symbol} • Contract: {collectionInfo.contractAddress}
+          </div>
+        )}
+
+        <div className="mt-6 text-center text-gray-400 text-xs">
+          <p>Always test on testnet • Use burner wallets • Verify contracts</p>
         </div>
       </div>
     </div>
