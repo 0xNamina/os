@@ -428,15 +428,23 @@ const OpenSeaAutoMint = () => {
           
           addLog(`📤 Sending transaction...`, 'info');
           
-          const tx = mintFunctionHasQuantity
-            ? await contract[mintFunctionName](1, {
-                value: mintValue,
-                gasPrice: gasPrice,
-              })
-            : await contract[mintFunctionName]({
-                value: mintValue,
-                gasPrice: gasPrice,
-              });
+ // Handle function overloading by specifying full signature
+let tx;
+if (mintFunctionHasQuantity) {
+  // For functions with quantity parameter, use full signature
+  const mintWithQuantity = contract.getFunction(`${mintFunctionName}(uint256)`);
+  tx = await mintWithQuantity(1, {
+    value: mintValue,
+    gasPrice: gasPrice,
+  });
+} else {
+  // For functions without parameters, use full signature
+  const mintWithoutParams = contract.getFunction(`${mintFunctionName}()`);
+  tx = await mintWithoutParams({
+    value: mintValue,
+    gasPrice: gasPrice,
+  });
+}
           
           addLog(`⏳ Waiting for confirmation... TX: ${tx.hash}`, 'info');
           
