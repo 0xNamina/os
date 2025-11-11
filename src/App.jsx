@@ -9,7 +9,8 @@ const OpenSeaAutoMint = () => {
     contractAddress: '',
     rpcUrl: '',
     privateKeys: '',
-    gasLevel: 'normal',
+    gasLevel: 'high', // Default to high for better success
+    customGasLimit: '300000',
   });
   
   const [mintPhases, setMintPhases] = useState({
@@ -19,9 +20,11 @@ const OpenSeaAutoMint = () => {
   });
   
   const [advancedOptions, setAdvancedOptions] = useState({
-    autoRetry: false,
+    autoRetry: true, // Enable by default
     sniperMode: false,
     flashbots: false,
+    maxPriorityFee: '2',
+    maxFee: '30',
   });
   
   const [wallets, setWallets] = useState([]);
@@ -37,6 +40,7 @@ const OpenSeaAutoMint = () => {
   const [contractABI, setContractABI] = useState(null);
   const [mintFunctionName, setMintFunctionName] = useState('');
   const [mintFunctionHasQuantity, setMintFunctionHasQuantity] = useState(false);
+  const [mintFunctionParams, setMintFunctionParams] = useState([]);
   
   const logsEndRef = useRef(null);
   
@@ -56,7 +60,8 @@ const OpenSeaAutoMint = () => {
   const parsePrivateKeys = (keys) => {
     return keys.split('\n')
       .map(k => k.trim())
-      .filter(k => k.length > 0 && k.startsWith('0x'))
+      .filter(k => k.length > 0 && (k.startsWith('0x') || k.length === 64))
+      .map(k => k.startsWith('0x') ? k : `0x${k}`)
       .slice(0, 10);
   };
   
@@ -94,8 +99,50 @@ const OpenSeaAutoMint = () => {
   };
   
   const getContractABI = async (contractAddress, chainId) => {
+    // Enhanced ABI with common mint functions
+    const commonABI = [
+      // Standard mint functions
+      "function mint() external payable",
+      "function mint(uint256 quantity) external payable",
+      "function publicMint() external payable",
+      "function publicMint(uint256 quantity) external payable",
+      "function mintPublic() external payable",
+      "function mintPublic(uint256 quantity) external payable",
+      
+      // Whitelist functions
+      "function whitelistMint() external payable",
+      "function whitelistMint(uint256 quantity) external payable",
+      "function allowlistMint() external payable",
+      "function allowlistMint(uint256 quantity) external payable",
+      "function preSaleMint() external payable",
+      "function preSaleMint(uint256 quantity) external payable",
+      
+      // Claim functions
+      "function claim() external payable",
+      "function claim(uint256 quantity) external payable",
+      
+      // Price functions
+      "function mintPrice() public view returns (uint256)",
+      "function cost() public view returns (uint256)",
+      "function price() public view returns (uint256)",
+      "function publicPrice() public view returns (uint256)",
+      "function getMintPrice() public view returns (uint256)",
+      
+      // Balance functions
+      "function balanceOf(address owner) public view returns (uint256)",
+      
+      // Sale status
+      "function publicSale() public view returns (bool)",
+      "function whitelistSale() public view returns (bool)",
+      
+      // EIP-721
+      "function safeTransferFrom(address from, address to, uint256 tokenId) external",
+      "function ownerOf(uint256 tokenId) external view returns (address)",
+      "function totalSupply() external view returns (uint256)"
+    ];
+    
     const apiKeys = {
-      1: 'HUCJSQE1V4UXYGZXIG9S7Z29WMM75ZC6EZ',
+      1: 'YourEtherscanAPIKey',
       137: 'YourPolygonscanAPIKey',
     };
     
@@ -109,71 +156,76 @@ const OpenSeaAutoMint = () => {
       10: 'https://api-optimistic.etherscan.io/api',
       8453: 'https://api.basescan.org/api',
       56: 'https://api.bscscan.com/api',
+      33139: 'https://api.apescan.io/api',
     };
     
     const apiUrl = apiUrls[chainId];
     if (!apiUrl) {
-      return [
-        "function mint() public payable",
-        "function publicMint() public payable",
-        "function mint(uint256 quantity) public payable",
-        "function publicMint(uint256 quantity) public payable",
-        "function mintPrice() public view returns (uint256)",
-        "function cost() public view returns (uint256)",
-        "function price() public view returns (uint256)",
-        "function balanceOf(address owner) public view returns (uint256)"
-      ];
+      addLog(`⚠️ Using generic ABI for chain ${chainId}`, 'warning');
+      return commonABI;
     }
     
     try {
+      const apiKey = apiKeys[chainId] || 'freekey';
       const response = await fetch(
-        `${apiUrl}?module=contract&action=getabi&address=${contractAddress}&apikey=${apiKeys[chainId] || ''}`
+        `${apiUrl}?module=contract&action=getabi&address=${contractAddress}&apikey=${apiKey}`
       );
       const data = await response.json();
       
       if (data.status === '1' && data.result) {
+        addLog(`✅ Fetched ABI from blockchain explorer`, 'success');
         return JSON.parse(data.result);
+      } else {
+        addLog(`⚠️ Could not fetch ABI from explorer, using generic`, 'warning');
+        return commonABI;
       }
     } catch (error) {
-      addLog(`⚠️ Could not fetch ABI, using generic ERC721 ABI`, 'warning');
+      addLog(`⚠️ Could not fetch ABI, using generic: ${error.message}`, 'warning');
+      return commonABI;
     }
-    
-    return [
-      "function mint() public payable",
-      "function publicMint() public payable",
-      "function mint(uint256 quantity) public payable",
-      "function publicMint(uint256 quantity) public payable",
-      "function whitelistMint() public payable",
-      "function allowlistMint() public payable",
-      "function mintPrice() public view returns (uint256)",
-      "function cost() public view returns (uint256)",
-      "function price() public view returns (uint256)",
-      "function balanceOf(address owner) public view returns (uint256)"
-    ];
   };
   
   const detectMintFunction = (abi) => {
     const mintFunctions = abi.filter(item => 
       item.type === 'function' && 
-      (item.name?.toLowerCase().includes('mint') || item.name === 'claim')
+      (item.name?.toLowerCase().includes('mint') || 
+       item.name?.toLowerCase().includes('claim') ||
+       item.name?.toLowerCase().includes('public'))
     );
     
-    const priorities = [
+    if (mintFunctions.length === 0) {
+      addLog('❌ No mint functions found in ABI', 'error');
+      return { name: 'mint', hasQuantity: false, params: [] };
+    }
+    
+    // Priority order for mint functions
+    const priorityFunctions = [
       { name: 'publicMint', params: 0 },
+      { name: 'mintPublic', params: 0 },
       { name: 'mint', params: 0 },
+      { name: 'claim', params: 0 },
       { name: 'whitelistMint', params: 0 },
       { name: 'allowlistMint', params: 0 },
-      { name: 'claim', params: 0 },
+      { name: 'preSaleMint', params: 0 },
     ];
     
-    for (const priority of priorities) {
+    // First try functions without parameters
+    for (const priority of priorityFunctions) {
       const found = mintFunctions.find(f => 
         f.name === priority.name && 
         (!f.inputs || f.inputs.length === priority.params)
       );
-      if (found) return { name: found.name, hasQuantity: false };
+      if (found) {
+        addLog(`🎯 Selected mint function: ${found.name}()`, 'success');
+        return { 
+          name: found.name, 
+          hasQuantity: false, 
+          params: [] 
+        };
+      }
     }
     
+    // Then try functions with quantity parameter
     const withQuantity = mintFunctions.find(f => 
       f.inputs && 
       f.inputs.length === 1 && 
@@ -181,30 +233,56 @@ const OpenSeaAutoMint = () => {
     );
     
     if (withQuantity) {
-      return { name: withQuantity.name, hasQuantity: true };
+      addLog(`🎯 Selected mint function: ${withQuantity.name}(uint256 quantity)`, 'success');
+      return { 
+        name: withQuantity.name, 
+        hasQuantity: true, 
+        params: [1] 
+      };
     }
     
-    return { name: mintFunctions[0]?.name || 'mint', hasQuantity: false };
+    // Fallback to first mint function
+    const fallback = mintFunctions[0];
+    addLog(`🎯 Using fallback mint function: ${fallback.name}`, 'warning');
+    return { 
+      name: fallback.name, 
+      hasQuantity: false, 
+      params: [] 
+    };
   };
   
   const getMintPrice = async (provider, contractAddress, abi) => {
     try {
       const contract = new ethers.Contract(contractAddress, abi, provider);
       
-      const priceGetters = ['mintPrice', 'cost', 'price', 'getMintPrice'];
+      const priceGetters = ['mintPrice', 'cost', 'price', 'publicPrice', 'getMintPrice'];
       
       for (const getter of priceGetters) {
         try {
-          const price = await contract[getter]();
-          return ethers.formatEther(price);
+          if (contract[getter]) {
+            const price = await contract[getter]();
+            if (price && price.toString() !== '0') {
+              return ethers.formatEther(price);
+            }
+          }
         } catch (e) {
           continue;
         }
       }
       
+      // Check if there's a fixed price in the contract
+      try {
+        const publicSale = await contract.publicSale();
+        if (publicSale) {
+          addLog('✅ Public sale is active', 'success');
+        }
+      } catch (e) {
+        // Ignore
+      }
+      
       return '0';
     } catch (error) {
-      addLog(`⚠️ Could not fetch mint price, assuming free mint`, 'warning');
+      addLog(`⚠️ Could not fetch mint price, assuming free mint: ${error.message}`, 'warning');
       return '0';
     }
   };
@@ -231,7 +309,7 @@ const OpenSeaAutoMint = () => {
     
     const keys = parsePrivateKeys(config.privateKeys);
     if (keys.length === 0) {
-      addLog('❌ No valid private keys found (must start with 0x)', 'error');
+      addLog('❌ No valid private keys found', 'error');
       setIsScanning(false);
       return;
     }
@@ -254,7 +332,7 @@ const OpenSeaAutoMint = () => {
       const mintFunc = detectMintFunction(abi);
       setMintFunctionName(mintFunc.name);
       setMintFunctionHasQuantity(mintFunc.hasQuantity);
-      addLog(`🎯 Detected mint function: ${mintFunc.name}(${mintFunc.hasQuantity ? 'uint256 quantity' : ''})`, 'info');
+      setMintFunctionParams(mintFunc.params);
       
       addLog('💰 Fetching mint price...', 'info');
       const price = await getMintPrice(provider, contractAddr, abi);
@@ -284,22 +362,19 @@ const OpenSeaAutoMint = () => {
             hasMinted = false;
           }
           
-          let gasEstimate = '0.002';
+          // Estimate gas with better accuracy
+          let gasEstimate = '0.005';
           try {
-            const estimateParams = { 
-              value: ethers.parseEther(price),
-              from: address 
-            };
-            
+            const value = ethers.parseEther(price || '0');
             const gasLimit = mintFunc.hasQuantity 
-              ? await contract[mintFunc.name].estimateGas(1, estimateParams)
-              : await contract[mintFunc.name].estimateGas(estimateParams);
+              ? await contract[mintFunc.name].estimateGas(1, { value })
+              : await contract[mintFunc.name].estimateGas({ value });
               
             const feeData = await provider.getFeeData();
-            const gasCost = gasLimit * feeData.gasPrice;
+            const gasCost = gasLimit * (feeData.gasPrice || feeData.maxFeePerGas || BigInt(30000000000));
             gasEstimate = ethers.formatEther(gasCost);
           } catch (e) {
-            // Use default
+            addLog(`⚠️ Gas estimation failed, using default: ${e.message}`, 'warning');
           }
           
           scanned.push({
@@ -326,7 +401,7 @@ const OpenSeaAutoMint = () => {
       
       setScannedWallets(scanned);
       setWallets(scanned);
-      setEstimatedGas(scanned[0]?.gasEstimate || '0.002');
+      setEstimatedGas(scanned[0]?.gasEstimate || '0.005');
       addLog(`✅ Scan complete! ${scanned.length} wallet(s) scanned`, 'success');
       
       if (scanned.length > 0) {
@@ -403,6 +478,7 @@ const OpenSeaAutoMint = () => {
       let mintSuccess = false;
       let retryCount = 0;
       let txHash = null;
+      let lastError = null;
       
       while (!mintSuccess && retryCount <= (advancedOptions.autoRetry ? 3 : 0)) {
         if (retryCount > 0) {
@@ -414,91 +490,114 @@ const OpenSeaAutoMint = () => {
           const contract = new ethers.Contract(contractAddr, contractABI, wallet);
           
           const feeData = await provider.getFeeData();
-          let gasPrice = feeData.gasPrice;
+          let gasPrice = feeData.gasPrice || feeData.maxFeePerGas || BigInt(30000000000);
           
+          // Apply gas level multiplier
           if (config.gasLevel === 'high') {
-            gasPrice = (gasPrice * 120n) / 100n;
+            gasPrice = (gasPrice * 150n) / 100n; // 50% higher for better success
           } else if (config.gasLevel === 'low') {
             gasPrice = (gasPrice * 80n) / 100n;
           }
           
           addLog(`⛽ Gas price: ${ethers.formatUnits(gasPrice, 'gwei')} Gwei`, 'info');
           
-          const mintValue = ethers.parseEther(mintPrice);
+          const mintValue = ethers.parseEther(mintPrice || '0');
+          const gasLimit = parseInt(config.customGasLimit) || 300000;
           
-          addLog(`📤 Sending transaction...`, 'info');
+          addLog(`📤 Sending transaction with ${gasLimit} gas limit...`, 'info');
           
           let tx;
+          
           try {
+            // Try the detected mint function first
             if (mintFunctionHasQuantity) {
-              const mintWithQuantity = contract.getFunction(`${mintFunctionName}(uint256)`);
-              tx = await mintWithQuantity(1, {
+              tx = await contract[mintFunctionName](1, {
                 value: mintValue,
                 gasPrice: gasPrice,
-                gasLimit: 300000,
+                gasLimit: gasLimit,
               });
             } else {
-              const mintWithoutParams = contract.getFunction(`${mintFunctionName}()`);
-              tx = await mintWithoutParams({
+              tx = await contract[mintFunctionName]({
                 value: mintValue,
                 gasPrice: gasPrice,
-                gasLimit: 300000,
+                gasLimit: gasLimit,
               });
             }
           } catch (txError) {
-            addLog(`⚠️ Trying alternative mint method...`, 'warning');
+            addLog(`⚠️ Primary mint method failed, trying alternatives...`, 'warning');
+            lastError = txError;
             
-            const mintVariations = [
-              { fn: 'mint', params: [] },
-              { fn: 'publicMint', params: [] },
-              { fn: 'mint', params: [1] },
-              { fn: 'publicMint', params: [1] },
+            // Try alternative mint functions
+            const alternativeFunctions = [
+              { name: 'mint', params: [] },
+              { name: 'publicMint', params: [] },
+              { name: 'mint', params: [1] },
+              { name: 'publicMint', params: [1] },
+              { name: 'mintPublic', params: [] },
+              { name: 'mintPublic', params: [1] },
+              { name: 'claim', params: [] },
+              { name: 'claim', params: [1] },
             ];
             
-            let success = false;
-            for (const variation of mintVariations) {
+            let alternativeSuccess = false;
+            for (const alt of alternativeFunctions) {
               try {
-                addLog(`Trying ${variation.fn}(${variation.params.join(',')})...`, 'info');
-                
-                if (variation.params.length === 0) {
-                  tx = await contract[variation.fn]({
-                    value: mintValue,
-                    gasPrice: gasPrice,
-                    gasLimit: 300000,
-                  });
-                } else {
-                  tx = await contract[variation.fn](...variation.params, {
-                    value: mintValue,
-                    gasPrice: gasPrice,
-                    gasLimit: 300000,
-                  });
+                if (contract[alt.name]) {
+                  addLog(`Trying ${alt.name}(${alt.params.join(',')})...`, 'info');
+                  
+                  if (alt.params.length === 0) {
+                    tx = await contract[alt.name]({
+                      value: mintValue,
+                      gasPrice: gasPrice,
+                      gasLimit: gasLimit,
+                    });
+                  } else {
+                    tx = await contract[alt.name](...alt.params, {
+                      value: mintValue,
+                      gasPrice: gasPrice,
+                      gasLimit: gasLimit,
+                    });
+                  }
+                  
+                  alternativeSuccess = true;
+                  addLog(`✅ Alternative function ${alt.name} worked!`, 'success');
+                  break;
                 }
-                success = true;
-                break;
               } catch (e) {
                 continue;
               }
             }
             
-            if (!success) {
+            if (!alternativeSuccess) {
               throw new Error('All mint methods failed. Contract may not be active or wallet not eligible.');
             }
           }
           
           addLog(`⏳ Waiting for confirmation... TX: ${tx.hash}`, 'info');
+          txHash = tx.hash;
           
           const receipt = await tx.wait();
           
           if (receipt.status === 1) {
             mintSuccess = true;
-            txHash = receipt.hash;
-            addLog(`✅ Success! TX: ${txHash}`, 'success');
+            addLog(`✅ Mint successful! TX: ${tx.hash}`, 'success');
+            
+            // Verify NFT was minted
+            try {
+              const nftBalance = await contract.balanceOf(walletInfo.address);
+              if (Number(nftBalance) > 0) {
+                addLog(`🎉 Verified: Wallet now has ${nftBalance} NFT(s)`, 'success');
+              }
+            } catch (e) {
+              // Ignore verification errors
+            }
           } else {
-            throw new Error('Transaction failed');
+            throw new Error('Transaction failed in receipt');
           }
           
         } catch (error) {
-          addLog(`❌ Mint attempt failed: ${error.message}`, 'error');
+          lastError = error;
+          addLog(`❌ Mint attempt ${retryCount + 1} failed: ${error.message}`, 'error');
           retryCount++;
           
           if (retryCount > (advancedOptions.autoRetry ? 3 : 0)) {
@@ -516,16 +615,17 @@ const OpenSeaAutoMint = () => {
         setMintStats(prev => ({ ...prev, success: prev.success + 1 }));
       } else {
         walletInfo.status = 'failed';
-        walletInfo.error = 'Transaction failed after retries';
+        walletInfo.error = lastError?.message || 'Transaction failed after retries';
         failedCount++;
         setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
       }
       
       setWallets([...updatedWallets]);
       
+      // Wait between wallets to avoid rate limiting
       if (i < updatedWallets.length - 1) {
-        addLog(`⏳ Waiting 5 seconds before next wallet...`, 'info');
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        addLog(`⏳ Waiting 3 seconds before next wallet...`, 'info');
+        await new Promise(resolve => setTimeout(resolve, 3000));
       }
     }
     
@@ -540,7 +640,8 @@ const OpenSeaAutoMint = () => {
       contractAddress: '',
       rpcUrl: '',
       privateKeys: '',
-      gasLevel: 'normal',
+      gasLevel: 'high',
+      customGasLimit: '300000',
     });
     setWallets([]);
     setScannedWallets([]);
@@ -551,10 +652,11 @@ const OpenSeaAutoMint = () => {
     setDetectedChain('');
     setChainSymbol('ETH');
     setMintPhases({ public: false, whitelist: false, allowlist: false });
-    setAdvancedOptions({ autoRetry: false, sniperMode: false, flashbots: false });
+    setAdvancedOptions({ autoRetry: true, sniperMode: false, flashbots: false, maxPriorityFee: '2', maxFee: '30' });
     setContractABI(null);
     setMintFunctionName('');
     setMintFunctionHasQuantity(false);
+    setMintFunctionParams([]);
   };
   
   const getStatusIcon = (status) => {
@@ -594,23 +696,6 @@ const OpenSeaAutoMint = () => {
       default:
         return 'Unknown';
     }
-  };
-  
-  const getExplorerUrl = (chainId, txHash) => {
-    const explorers = {
-      1: 'https://etherscan.io',
-      5: 'https://goerli.etherscan.io',
-      11155111: 'https://sepolia.etherscan.io',
-      137: 'https://polygonscan.com',
-      80001: 'https://mumbai.polygonscan.com',
-      42161: 'https://arbiscan.io',
-      10: 'https://optimistic.etherscan.io',
-      8453: 'https://basescan.org',
-      56: 'https://bscscan.com',
-      33139: 'https://apescan.io',
-    };
-    
-    return `${explorers[chainId] || 'https://etherscan.io'}/tx/${txHash}`;
   };
 
   return (
@@ -679,7 +764,7 @@ const OpenSeaAutoMint = () => {
                 
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Private Keys (max 10, one per line, must start with 0x)
+                    Private Keys (max 10, one per line)
                   </label>
                   <textarea
                     value={config.privateKeys}
@@ -693,8 +778,8 @@ const OpenSeaAutoMint = () => {
                   </p>
                 </div>
                 
-                <div className="flex gap-4">
-                  <div className="flex-1">
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Gas Level</label>
                     <select
                       value={config.gasLevel}
@@ -703,10 +788,24 @@ const OpenSeaAutoMint = () => {
                     >
                       <option value="low">Low (Slower, -20%)</option>
                       <option value="normal">Normal (Recommended)</option>
-                      <option value="high">High (Faster, +20%)</option>
+                      <option value="high">High (Faster, +50%)</option>
                     </select>
                   </div>
                   
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Gas Limit</label>
+                    <input
+                      type="text"
+                      value={config.customGasLimit}
+                      onChange={(e) => setConfig({ ...config, customGasLimit: e.target.value })}
+                      placeholder="300000"
+                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    />
+                  </div>
+                </div>
+                
+                <div className="flex gap-4">
+                  <div className="flex-1"></div>
                   <div className="flex items-end">
                     <button
                       onClick={scanWallets}
@@ -721,7 +820,7 @@ const OpenSeaAutoMint = () => {
                       ) : (
                         <>
                           <Scan className="w-4 h-4" />
-                          Scan Eligible
+                          Scan Wallets
                         </>
                       )}
                     </button>
@@ -770,7 +869,7 @@ const OpenSeaAutoMint = () => {
               
               <div className="mt-4 pt-4 border-t border-slate-700">
                 <label className="block text-sm font-medium text-gray-300 mb-3">
-                  Advanced Options (Optional)
+                  Advanced Options
                 </label>
                 <div className="flex flex-wrap gap-4">
                   <label className="flex items-center gap-2 cursor-pointer">
@@ -819,7 +918,7 @@ const OpenSeaAutoMint = () => {
                   ) : (
                     <>
                       <Zap className="w-5 h-5" />
-                      Start Mint
+                      Start Auto Mint
                     </>
                   )}
                 </button>
@@ -864,7 +963,7 @@ const OpenSeaAutoMint = () => {
                         </p>
                         {wallet.txHash && (
                           <a
-                            href={getExplorerUrl(1, wallet.txHash)}
+                            href={`https://etherscan.io/tx/${wallet.txHash}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="text-xs text-purple-400 hover:text-purple-300"
@@ -931,6 +1030,12 @@ const OpenSeaAutoMint = () => {
                       <span className="text-white font-mono text-sm">
                         {mintFunctionName}({mintFunctionHasQuantity ? 'uint256' : ''})
                       </span>
+                    </div>
+                  )}
+                  {config.customGasLimit && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Gas Limit:</span>
+                      <span className="text-white font-semibold">{config.customGasLimit}</span>
                     </div>
                   )}
                 </div>
