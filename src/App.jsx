@@ -11,7 +11,7 @@ import { Loader2, CheckCircle, XCircle, Clock, AlertCircle } from 'lucide-react'
  */
 const OpenSeaAutoMint = () => {
   // Optional: set your OpenSea API key here or via UI input
-  const [OPENSEA_API_KEY, setOPENSEA_API_KEY] = useState('');
+  const [OPENSEA_API_KEY, setOPENSEA_API_KEY] = useState('opensea_api_key_1b5d949c4b3344a5a482a28b60147390');
 
   const [config, setConfig] = useState({
     collectionUrl: '',
