@@ -1,1349 +1,422 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Loader2, CheckCircle, XCircle, Clock, AlertCircle, Scan, Zap, ExternalLink } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { ethers } from 'ethers';
 
-const ethers = window.ethers;
+/**
+ * Mint helper UI — router‑aware (OpenSea/SeaDrop, Creator, Launchpads)
+ *
+ * Highlights:
+ * - Supports **router-style** mint functions (first arg `address nft`) and direct NFT mint.
+ * - Accepts **Launchpad/Router** and **NFT Contract** addresses separately.
+ * - EIP‑1559 fee handling (maxFeePerGas / maxPriorityFeePerGas) with low/normal/high multipliers.
+ * - Chain auto-detect from RPC + proper block explorer links.
+ * - ABI fetcher for many Etherscan-family explorers (or paste ABI manually).
+ * - Safety filters: skip functions that clearly require allowlist proof/signature.
+ */
 
-const OpenSeaAutoMint = () => {
-  const [config, setConfig] = useState({
-    launchpadUrl: '',
-    contractAddress: '',
-    rpcUrl: '',
-    privateKeys: '',
-    gasLevel: 'high',
-    customGasLimit: '400000',
-    mintQuantity: '1'
-  });
-  
-  const [mintPhases, setMintPhases] = useState({
-    public: false,
-    whitelist: false,
-    allowlist: false,
-  });
-  
-  const [advancedOptions, setAdvancedOptions] = useState({
-    autoRetry: true,
-    sniperMode: false,
-    flashbots: false,
-    maxPriorityFee: '2',
-    maxFee: '30',
-    simulateTx: true,
-    detectCollection: true,
-  });
-  
-  const [wallets, setWallets] = useState([]);
-  const [scannedWallets, setScannedWallets] = useState([]);
+const CHAIN_META = /** @type {Record<number, {name:string,symbol:string,explorer:string,scanApi?:string}>} */ ({
+  1:   { name: 'Ethereum', symbol: 'ETH', explorer: 'https://etherscan.io',         scanApi: 'https://api.etherscan.io/api' },
+  5:   { name: 'Goerli',   symbol: 'ETH', explorer: 'https://goerli.etherscan.io',  scanApi: 'https://api-goerli.etherscan.io/api' },
+  11155111: { name: 'Sepolia', symbol: 'ETH', explorer: 'https://sepolia.etherscan.io', scanApi: 'https://api-sepolia.etherscan.io/api' },
+  10:  { name: 'OP Mainnet', symbol: 'ETH', explorer: 'https://optimistic.etherscan.io', scanApi: 'https://api-optimistic.etherscan.io/api' },
+  420: { name: 'OP Goerli', symbol: 'ETH', explorer: 'https://goerli-optimism.etherscan.io' },
+  8453:{ name: 'Base', symbol: 'ETH', explorer: 'https://basescan.org',            scanApi: 'https://api.basescan.org/api' },
+  84531:{ name: 'Base Goerli', symbol: 'ETH', explorer: 'https://goerli.basescan.org' },
+  42161:{ name: 'Arbitrum One', symbol: 'ETH', explorer: 'https://arbiscan.io',    scanApi: 'https://api.arbiscan.io/api' },
+  421614:{ name: 'Arbitrum Sepolia', symbol: 'ETH', explorer: 'https://sepolia.arbiscan.io' },
+  137: { name: 'Polygon', symbol: 'MATIC', explorer: 'https://polygonscan.com',    scanApi: 'https://api.polygonscan.com/api' },
+  80002:{ name: 'Polygon Amoy', symbol: 'MATIC', explorer: 'https://amoy.polygonscan.com' },
+});
+
+const guessSymbol = (chainId) => CHAIN_META[chainId]?.symbol || 'ETH';
+const getExplorerUrl = (chainId, txHash) => `${CHAIN_META[chainId]?.explorer || 'https://etherscan.io'}/tx/${txHash}`;
+
+async function detectChainFromRPC(rpcUrl){
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const net = await provider.getNetwork();
+  const chainId = Number(net.chainId);
+  return { chainId, name: CHAIN_META[chainId]?.name || `Chain ${chainId}`, symbol: guessSymbol(chainId) };
+}
+
+function isAddressLike(v=''){ try{ return !!ethers.getAddress(v.trim()); }catch{ return false; } }
+
+// Fetch ABI from Etherscan family; if apiKey omitted, many endpoints still work for public ABIs
+async function fetchAbiFromExplorer(chainId, address, apiKey){
+  const base = CHAIN_META[chainId]?.scanApi;
+  if(!base) throw new Error(`No explorer API configured for chainId ${chainId}`);
+  const url = new URL(base);
+  url.searchParams.set('module','contract');
+  url.searchParams.set('action','getabi');
+  url.searchParams.set('address', address);
+  if(apiKey) url.searchParams.set('apikey', apiKey);
+  const res = await fetch(url.toString());
+  if(!res.ok) throw new Error(`Explorer API HTTP ${res.status}`);
+  const data = await res.json();
+  if(data.status !== '1') throw new Error(data.result || 'Failed to fetch ABI');
+  return JSON.parse(data.result);
+}
+
+// Very small heuristic to choose a mint function from an ABI
+function detectMintSignature(abi){
+  const fns = abi.filter(i => i.type === 'function')
+                 .filter(i => /mint|claim/i.test(i.name || ''));
+  if(fns.length === 0) return null;
+
+  // Prefer router-like: first arg is address (nft)
+  const routerLike = fns.find(f => (f.inputs?.length||0) >= 1 && f.inputs[0].type === 'address');
+  if(routerLike) return { fn: routerLike, style: 'router' };
+
+  // Direct with quantity
+  const directQty = fns.find(f => (f.inputs?.length||0) === 1 && f.inputs[0].type === 'uint256');
+  if(directQty) return { fn: directQty, style: 'directQty' };
+
+  // Direct no-arg
+  const direct0 = fns.find(f => (f.inputs?.length||0) === 0);
+  if(direct0) return { fn: direct0, style: 'direct0' };
+
+  // Otherwise first mint-like
+  return { fn: fns[0], style: 'unknown' };
+}
+
+// Quick check if function obviously needs allowlist proof/signature
+function looksAllowlistOnly(inputs){
+  const types = (inputs||[]).map(x=>x.type);
+  if(types.some(t => /bytes32\[\]|bytes|signature/i.test(t))) return true;
+  // many allowlist functions include multiple time/price/nonce params
+  const manyNums = types.filter(t=>t.startsWith('uint')).length >= 3;
+  return manyNums;
+}
+
+function useLogs(){
   const [logs, setLogs] = useState([]);
-  const [isScanning, setIsScanning] = useState(false);
-  const [isMinting, setIsMinting] = useState(false);
-  const [mintStats, setMintStats] = useState({ success: 0, failed: 0, total: 0 });
-  const [mintPrice, setMintPrice] = useState('0');
-  const [estimatedGas, setEstimatedGas] = useState('0');
-  const [detectedChain, setDetectedChain] = useState('');
-  const [chainSymbol, setChainSymbol] = useState('ETH');
-  const [contractABI, setContractABI] = useState(null);
-  const [mintFunctionName, setMintFunctionName] = useState('');
-  const [mintFunctionHasQuantity, setMintFunctionHasQuantity] = useState(false);
-  const [mintFunctionParams, setMintFunctionParams] = useState([]);
-  const [contractDetails, setContractDetails] = useState({});
-  const [contractType, setContractType] = useState('unknown'); // 'nft', 'creator', 'unknown'
-  const [nftContractAddress, setNftContractAddress] = useState('');
-  
-  const logsEndRef = useRef(null);
-  
-  const scrollToBottom = () => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-  
-  useEffect(() => {
-    scrollToBottom();
-  }, [logs]);
-  
-  const addLog = (message, type = 'info') => {
-    const timestamp = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, { timestamp, message, type }]);
-  };
-  
-  const parsePrivateKeys = (keys) => {
-    return keys.split('\n')
-      .map(k => k.trim())
-      .filter(k => k.length > 0 && (k.startsWith('0x') || k.length === 64))
-      .map(k => k.startsWith('0x') ? k : `0x${k}`)
-      .slice(0, 10);
-  };
-  
-  const extractContractAddress = (url) => {
-    const match = url.match(/0x[a-fA-F0-9]{40}/);
-    return match ? match[0] : url;
-  };
-  
-  const detectChainFromRPC = async (rpcUrl) => {
-    try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const network = await provider.getNetwork();
-      const chainId = Number(network.chainId);
-      
-      const chains = {
-        1: { name: 'Ethereum Mainnet', symbol: 'ETH' },
-        5: { name: 'Goerli Testnet', symbol: 'ETH' },
-        11155111: { name: 'Sepolia Testnet', symbol: 'ETH' },
-        137: { name: 'Polygon', symbol: 'MATIC' },
-        80001: { name: 'Mumbai Testnet', symbol: 'MATIC' },
-        42161: { name: 'Arbitrum One', symbol: 'ETH' },
-        10: { name: 'Optimism', symbol: 'ETH' },
-        8453: { name: 'Base', symbol: 'ETH' },
-        43114: { name: 'Avalanche', symbol: 'AVAX' },
-        56: { name: 'BSC', symbol: 'BNB' },
-        33139: { name: 'APE Chain', symbol: 'APE' },
-      };
-      
-      const chainInfo = chains[chainId] || { name: `Chain ID: ${chainId}`, symbol: 'ETH' };
-      return { name: chainInfo.name, symbol: chainInfo.symbol, chainId };
-    } catch (error) {
-      addLog(`❌ Failed to detect chain: ${error.message}`, 'error');
-      return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0 };
-    }
-  };
+  const push = (type, message) => setLogs(prev => [...prev, { ts: new Date().toISOString(), type, message }]);
+  const clear = () => setLogs([]);
+  return { logs, push, clear };
+}
 
-  const detectContractType = async (provider, contractAddress, abi) => {
-    try {
-      const contract = new ethers.Contract(contractAddress, abi, provider);
-      
-      // Check if it's an NFT contract (ERC721/ERC1155)
-      try {
-        const supportsInterface = contract.supportsInterface;
-        if (supportsInterface) {
-          // Check ERC721 interface
-          const isERC721 = await supportsInterface('0x80ac58cd');
-          if (isERC721) {
-            addLog('✅ Contract type: ERC721 NFT Collection', 'success');
-            return 'nft';
-          }
-          
-          // Check ERC1155 interface
-          const isERC1155 = await supportsInterface('0xd9b67a26');
-          if (isERC1155) {
-            addLog('✅ Contract type: ERC1155 NFT Collection', 'success');
-            return 'nft';
-          }
-        }
-      } catch (e) {
-        // Continue to other checks
-      }
-      
-      // Check for common NFT functions
-      try {
-        await contract.balanceOf(contractAddress); // Just check if function exists
-        const name = await contract.name();
-        const symbol = await contract.symbol();
-        addLog(`✅ Contract type: NFT Collection (${name} - ${symbol})`, 'success');
-        return 'nft';
-      } catch (e) {
-        // Not an NFT contract
-      }
-      
-      // Check for creator/factory contract functions
-      const factoryFunctions = ['createDrop', 'createCollection', 'mint', 'publicMint', 'createEdition'];
-      const hasFactoryFunction = abi.some(item => 
-        item.type === 'function' && 
-        factoryFunctions.some(fn => item.name?.toLowerCase().includes(fn))
-      );
-      
-      if (hasFactoryFunction) {
-        addLog('✅ Contract type: Creator/Factory Contract', 'success');
-        
-        // Try to detect the actual NFT contract address
-        if (advancedOptions.detectCollection) {
-          try {
-            // Common patterns for factory contracts
-            const detectionMethods = [
-              { method: 'nftContract', params: [] },
-              { method: 'collection', params: [] },
-              { method: 'getCollection', params: [0] },
-              { method: 'editions', params: [0] },
-            ];
-            
-            for (const method of detectionMethods) {
-              try {
-                if (contract[method.method]) {
-                  const nftAddress = await contract[method.method](...method.params);
-                  if (nftAddress && nftAddress !== '0x0000000000000000000000000000000000000000') {
-                    setNftContractAddress(nftAddress);
-                    addLog(`📍 Detected NFT contract: ${nftAddress}`, 'success');
-                    break;
-                  }
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-          } catch (e) {
-            addLog('⚠️ Could not detect NFT contract from factory', 'warning');
-          }
-        }
-        
-        return 'creator';
-      }
-      
-      addLog('⚠️ Contract type: Unknown (trying both NFT and Creator methods)', 'warning');
-      return 'unknown';
-      
-    } catch (error) {
-      addLog(`❌ Error detecting contract type: ${error.message}`, 'error');
-      return 'unknown';
+export default function App(){
+  const { logs, push, clear } = useLogs();
+
+  const [config, setConfig] = useState({
+    rpcUrl: '',
+    explorerApiKey: '', // optional (Etherscan/Basescan/Polygonscan/etc)
+    launchpadContractAddress: '', // router / creator / SeaDrop
+    nftContractAddress: '',
+    privateKeys: '', // one per line
+    gasLevel: 'normal', // low | normal | high
+    mintPriceEth: '0', // send value per mint
+    quantity: 1,
+    manualLaunchpadAbi: '',
+    manualNftAbi: '',
+  });
+
+  const [chain, setChain] = useState({ chainId: 0, name: '', symbol: 'ETH' });
+  const [wallets, setWallets] = useState([]); // {address, pk, lastTx, status}
+  const [busy, setBusy] = useState(false);
+
+  const canScan = useMemo(()=>{
+    return !!config.rpcUrl && (isAddressLike(config.launchpadContractAddress) || isAddressLike(config.nftContractAddress));
+  }, [config]);
+
+  async function onDetectChain(){
+    try{
+      const info = await detectChainFromRPC(config.rpcUrl);
+      setChain(info);
+      push('info', `RPC connected → ${info.name} (chainId=${info.chainId})`);
+    }catch(err){
+      push('error', `RPC error: ${err.message}`);
     }
-  };
-  
-  const getContractABI = async (contractAddress, chainId) => {
-    // Comprehensive ABI that covers both NFT and Factory contracts
-    const comprehensiveABI = [
-      // Standard NFT functions (ERC721/ERC1155)
-      "function balanceOf(address owner) public view returns (uint256)",
-      "function ownerOf(uint256 tokenId) public view returns (address)",
-      "function safeTransferFrom(address from, address to, uint256 tokenId) external",
-      "function transferFrom(address from, address to, uint256 tokenId) external",
-      "function approve(address to, uint256 tokenId) external",
-      "function setApprovalForAll(address operator, bool approved) external",
-      "function getApproved(uint256 tokenId) public view returns (address)",
-      "function isApprovedForAll(address owner, address operator) public view returns (bool)",
-      "function name() public view returns (string)",
-      "function symbol() public view returns (string)",
-      "function tokenURI(uint256 tokenId) public view returns (string)",
-      "function totalSupply() public view returns (uint256)",
-      "function supportsInterface(bytes4 interfaceId) public view returns (bool)",
-      
-      // ERC1155 specific
-      "function balanceOf(address account, uint256 id) public view returns (uint256)",
-      "function balanceOfBatch(address[] accounts, uint256[] ids) public view returns (uint256[])",
-      "function setApprovalForAll(address operator, bool approved) external",
-      "function isApprovedForAll(address account, address operator) public view returns (bool)",
-      "function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes data) external",
-      "function safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] amounts, bytes data) external",
-      
-      // Standard mint functions for NFT contracts
-      "function mint() external payable",
-      "function mint(uint256 quantity) external payable",
-      "function publicMint() external payable",
-      "function publicMint(uint256 quantity) external payable",
-      "function mintPublic() external payable",
-      "function mintPublic(uint256 quantity) external payable",
-      "function claim() external payable",
-      "function claim(uint256 quantity) external payable",
-      
-      // Factory/Creator contract functions
-      "function createDrop(string name, string symbol, address defaultAdmin, address payoutAddress, uint64 publicMintStart, uint96 fee, uint96 maxSupply, string contractURI) external returns (address)",
-      "function createCollection(string name, string symbol, string contractURI) external returns (address)",
-      "function createEdition(string name, string symbol, uint256 maxSupply, uint256 price, uint256 maxTokensPerAddress, uint256 mintStart, address payoutAddress, string contractURI) external returns (address)",
-      "function mint(address to, uint256 quantity) external payable",
-      "function purchase(uint256 quantity) external payable",
-      "function createAndMint(string name, string symbol, uint256 quantity, bytes data) external payable",
-      
-      // Price and sale functions
-      "function mintPrice() public view returns (uint256)",
-      "function cost() public view returns (uint256)",
-      "function price() public view returns (uint256)",
-      "function publicPrice() public view returns (uint256)",
-      "function getMintPrice() public view returns (uint256)",
-      "function PRICE() public view returns (uint256)",
-      "function publicSale() public view returns (bool)",
-      "function isPublicSaleActive() public view returns (bool)",
-      "function saleState() public view returns (uint256)",
-      "function mintEnabled() public view returns (bool)",
-      
-      // Factory contract view functions
-      "function nftContract() public view returns (address)",
-      "function collection() public view returns (address)",
-      "function getCollection(uint256 index) public view returns (address)",
-      "function editions(uint256 index) public view returns (address)",
-      "function getAllCollections() public view returns (address[])",
-      
-      // Supply functions
-      "function totalSupply() public view returns (uint256)",
-      "function MAX_SUPPLY() public view returns (uint256)",
-      "function maxSupply() public view returns (uint256)",
-      "function maxMintPerWallet() public view returns (uint256)",
-    ];
-    
-    // Try to fetch from blockchain explorer first
-    const apiUrls = {
-      1: 'https://api.etherscan.io/api',
-      5: 'https://api-goerli.etherscan.io/api',
-      11155111: 'https://api-sepolia.etherscan.io/api',
-      137: 'https://api.polygonscan.com/api',
-      80001: 'https://api-testnet.polygonscan.com/api',
-      42161: 'https://api.arbiscan.io/api',
-      10: 'https://api-optimistic.etherscan.io/api',
-      8453: 'https://api.basescan.org/api',
-      56: 'https://api.bscscan.com/api',
-      33139: 'https://api.apescan.io/api',
-    };
-    
-    const apiUrl = apiUrls[chainId];
-    if (!apiUrl) {
-      addLog(`ℹ️ Using comprehensive ABI for unknown chain`, 'info');
-      return comprehensiveABI;
+  }
+
+  function parseKeys(){
+    return config.privateKeys.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  }
+
+  async function loadAbis(){
+    const out = { launchpadAbi: null, nftAbi: null };
+    try{
+      if(config.manualLaunchpadAbi.trim()) out.launchpadAbi = JSON.parse(config.manualLaunchpadAbi);
+      if(config.manualNftAbi.trim()) out.nftAbi = JSON.parse(config.manualNftAbi);
+    }catch(e){ throw new Error('Manual ABI JSON invalid'); }
+
+    const needLaunchpad = !out.launchpadAbi && isAddressLike(config.launchpadContractAddress);
+    const needNft       = !out.nftAbi && isAddressLike(config.nftContractAddress);
+    if(!CHAIN_META[chain.chainId]) push('warn', `Explorer API not known for chainId ${chain.chainId}; paste ABI manually if fetch fails.`);
+
+    if(needLaunchpad){
+      try{
+        out.launchpadAbi = await fetchAbiFromExplorer(chain.chainId, config.launchpadContractAddress, config.explorerApiKey);
+        push('info', `Fetched ABI (launchpad)`);
+      }catch(e){ push('warn', `Launchpad ABI fetch failed: ${e.message}`); }
     }
-    
-    try {
-      const response = await fetch(
-        `${apiUrl}?module=contract&action=getabi&address=${contractAddress}`
-      );
-      const data = await response.json();
-      
-      if (data.status === '1' && data.result) {
-        addLog(`✅ Fetched ABI from blockchain explorer`, 'success');
-        const fetchedABI = JSON.parse(data.result);
-        // Combine with our comprehensive ABI
-        const combinedABI = [...fetchedABI];
-        comprehensiveABI.forEach(item => {
-          if (!fetchedABI.some(fetched => fetched.name === item.name)) {
-            combinedABI.push(item);
-          }
-        });
-        return combinedABI;
-      } else {
-        addLog(`ℹ️ Using comprehensive ABI (explorer not available)`, 'info');
-        return comprehensiveABI;
-      }
-    } catch (error) {
-      addLog(`ℹ️ Using comprehensive ABI: ${error.message}`, 'info');
-      return comprehensiveABI;
+    if(needNft){
+      try{
+        out.nftAbi = await fetchAbiFromExplorer(chain.chainId, config.nftContractAddress, config.explorerApiKey);
+        push('info', `Fetched ABI (NFT)`);
+      }catch(e){ push('warn', `NFT ABI fetch failed: ${e.message}`); }
     }
-  };
-  
-  const detectMintFunction = (abi, contractType) => {
-    let mintFunctions = [];
-    
-    if (contractType === 'nft') {
-      // For NFT contracts, look for standard mint functions
-      mintFunctions = abi.filter(item => 
-        item.type === 'function' && 
-        (item.name?.toLowerCase().includes('mint') || 
-         item.name?.toLowerCase().includes('claim') ||
-         item.name?.toLowerCase().includes('public'))
-      );
-    } else if (contractType === 'creator') {
-      // For creator contracts, look for factory mint functions
-      mintFunctions = abi.filter(item => 
-        item.type === 'function' && 
-        (item.name?.toLowerCase().includes('mint') ||
-         item.name?.toLowerCase().includes('purchase') ||
-         item.name?.toLowerCase().includes('create'))
-      );
-    } else {
-      // For unknown, try everything
-      mintFunctions = abi.filter(item => 
-        item.type === 'function' && 
-        (item.name?.toLowerCase().includes('mint') || 
-         item.name?.toLowerCase().includes('claim') ||
-         item.name?.toLowerCase().includes('public') ||
-         item.name?.toLowerCase().includes('purchase') ||
-         item.name?.toLowerCase().includes('create'))
-      );
-    }
-    
-    if (mintFunctions.length === 0) {
-      addLog('❌ No mint functions found in ABI', 'error');
-      return { name: 'mint', hasQuantity: false, params: [] };
-    }
-    
-    addLog(`🔍 Found ${mintFunctions.length} potential mint functions`, 'info');
-    
-    // Priority order differs based on contract type
-    let priorityFunctions = [];
-    
-    if (contractType === 'nft') {
-      priorityFunctions = [
-        { name: 'mint', params: 0, payable: true },
-        { name: 'publicMint', params: 0, payable: true },
-        { name: 'mintPublic', params: 0, payable: true },
-        { name: 'claim', params: 0, payable: true },
-        { name: 'mint', params: 1, payable: true },
-        { name: 'publicMint', params: 1, payable: true },
-      ];
-    } else if (contractType === 'creator') {
-      priorityFunctions = [
-        { name: 'mint', params: 0, payable: true },
-        { name: 'purchase', params: 0, payable: true },
-        { name: 'mint', params: 1, payable: true },
-        { name: 'purchase', params: 1, payable: true },
-        { name: 'createAndMint', params: 3, payable: true },
-      ];
-    } else {
-      // For unknown, try both
-      priorityFunctions = [
-        { name: 'mint', params: 0, payable: true },
-        { name: 'publicMint', params: 0, payable: true },
-        { name: 'purchase', params: 0, payable: true },
-        { name: 'mint', params: 1, payable: true },
-        { name: 'publicMint', params: 1, payable: true },
-        { name: 'purchase', params: 1, payable: true },
-        { name: 'claim', params: 0, payable: true },
-      ];
-    }
-    
-    // Find the best matching function
-    for (const priority of priorityFunctions) {
-      const found = mintFunctions.find(f => 
-        f.name === priority.name && 
-        (!f.inputs || f.inputs.length === priority.params) &&
-        (f.stateMutability === 'payable' || !priority.payable)
-      );
-      
-      if (found) {
-        addLog(`🎯 Selected mint function: ${found.name}(${'uint256 '.repeat(priority.params).trim()})`, 'success');
-        return { 
-          name: found.name, 
-          hasQuantity: priority.params > 0, 
-          params: priority.params > 0 ? [parseInt(config.mintQuantity)] : [] 
-        };
-      }
-    }
-    
-    // Fallback to first payable mint function
-    const fallback = mintFunctions.find(f => f.stateMutability === 'payable') || mintFunctions[0];
-    if (fallback) {
-      const hasQuantity = fallback.inputs && fallback.inputs.length > 0;
-      addLog(`⚠️ Using fallback mint function: ${fallback.name}`, 'warning');
-      return { 
-        name: fallback.name, 
-        hasQuantity: hasQuantity,
-        params: hasQuantity ? [parseInt(config.mintQuantity)] : []
-      };
-    }
-    
-    addLog('❌ No suitable mint function found', 'error');
-    return { name: 'mint', hasQuantity: false, params: [] };
-  };
-  
-  const analyzeContract = async (provider, contractAddress, abi, contractType) => {
-    try {
-      const contract = new ethers.Contract(contractAddress, abi, provider);
-      const details = {};
-      
-      // Check contract type specific details
-      if (contractType === 'nft') {
-        try {
-          const name = await contract.name();
-          const symbol = await contract.symbol();
-          details.name = name;
-          details.symbol = symbol;
-          addLog(`📛 NFT: ${name} (${symbol})`, 'success');
-        } catch (e) {}
-      }
-      
-      // Check sale status
-      const saleCheckers = ['publicSale', 'isPublicSaleActive', 'mintEnabled', 'saleState'];
-      for (const checker of saleCheckers) {
-        try {
-          if (contract[checker]) {
-            const status = await contract[checker]();
-            details.saleStatus = { checker, status: status.toString() };
-            addLog(`📊 Sale status (${checker}): ${status}`, 'info');
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      // Get mint price
-      const priceGetters = ['mintPrice', 'cost', 'price', 'publicPrice', 'getMintPrice', 'PRICE'];
-      for (const getter of priceGetters) {
-        try {
-          if (contract[getter]) {
-            const price = await contract[getter]();
-            if (price && price.toString() !== '0') {
-              details.mintPrice = ethers.formatEther(price);
-              addLog(`💰 Mint Price: ${details.mintPrice} ${chainSymbol}`, 'success');
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      // Get supply info for NFT contracts
-      if (contractType === 'nft') {
-        try {
-          if (contract.totalSupply) {
-            const totalSupply = await contract.totalSupply();
-            details.totalSupply = totalSupply.toString();
-            addLog(`📈 Total Supply: ${details.totalSupply}`, 'info');
-          }
-        } catch (e) {}
-        
-        try {
-          if (contract.MAX_SUPPLY || contract.maxSupply) {
-            const maxSupply = await (contract.MAX_SUPPLY ? contract.MAX_SUPPLY() : contract.maxSupply());
-            details.maxSupply = maxSupply.toString();
-            addLog(`📊 Max Supply: ${details.maxSupply}`, 'info');
-          }
-        } catch (e) {}
-      }
-      
-      setContractDetails(details);
-      return details.mintPrice || '0';
-      
-    } catch (error) {
-      addLog(`⚠️ Contract analysis failed: ${error.message}`, 'warning');
-      return '0';
-    }
-  };
-  
-  const scanWallets = async () => {
-    if (!ethers) {
-      addLog('❌ Ethers.js not loaded yet, please refresh page', 'error');
-      return;
-    }
-    
-    if (!config.rpcUrl || !config.privateKeys) {
-      addLog('❌ Please fill RPC URL and Private Keys', 'error');
-      return;
-    }
-    
-    const contractAddr = config.contractAddress || extractContractAddress(config.launchpadUrl);
-    if (!contractAddr || !contractAddr.startsWith('0x') || contractAddr.length !== 42) {
-      addLog('❌ Invalid contract address', 'error');
-      return;
-    }
-    
-    setIsScanning(true);
-    addLog('🔍 Starting wallet scan...', 'info');
-    
-    const keys = parsePrivateKeys(config.privateKeys);
-    if (keys.length === 0) {
-      addLog('❌ No valid private keys found', 'error');
-      setIsScanning(false);
-      return;
-    }
-    
-    addLog(`📝 Found ${keys.length} wallet(s) to scan`, 'info');
-    
-    try {
+    return out;
+  }
+
+  async function scan(){
+    clear();
+    if(!canScan){ push('error','Lengkapi RPC & salah satu alamat kontrak.'); return; }
+    try{
+      if(!chain.chainId) await onDetectChain();
       const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-      addLog('🔗 Connected to RPC...', 'info');
-      
-      const chainInfo = await detectChainFromRPC(config.rpcUrl);
-      setDetectedChain(chainInfo.name);
-      setChainSymbol(chainInfo.symbol);
-      addLog(`🔗 Chain: ${chainInfo.name} (${chainSymbol})`, 'info');
-      
-      addLog('📄 Fetching contract ABI...', 'info');
-      const abi = await getContractABI(contractAddr, chainInfo.chainId);
-      setContractABI(abi);
-      
-      addLog('🔍 Detecting contract type...', 'info');
-      const detectedType = await detectContractType(provider, contractAddr, abi);
-      setContractType(detectedType);
-      
-      addLog('🔍 Analyzing contract...', 'info');
-      const price = await analyzeContract(provider, contractAddr, abi, detectedType);
-      setMintPrice(price);
-      
-      const mintFunc = detectMintFunction(abi, detectedType);
-      setMintFunctionName(mintFunc.name);
-      setMintFunctionHasQuantity(mintFunc.hasQuantity);
-      setMintFunctionParams(mintFunc.params);
-      
-      const contract = new ethers.Contract(contractAddr, abi, provider);
-      const scanned = [];
-      
-      for (let i = 0; i < keys.length; i++) {
-        const key = keys[i];
-        
-        try {
-          const wallet = new ethers.Wallet(key, provider);
-          const address = wallet.address;
-          
-          addLog(`Scanning wallet ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
-          
-          const balanceWei = await provider.getBalance(address);
-          const balance = ethers.formatEther(balanceWei);
-          
-          let hasMinted = false;
-          // Only check mint status for NFT contracts
-          if (detectedType === 'nft' && nftContractAddress) {
-            try {
-              const nftContract = new ethers.Contract(nftContractAddress, abi, provider);
-              const nftBalance = await nftContract.balanceOf(address);
-              hasMinted = Number(nftBalance) > 0;
-              if (hasMinted) {
-                addLog(`ℹ️ Wallet already has ${nftBalance} NFT(s)`, 'info');
-              }
-            } catch (e) {
-              // Ignore errors for factory contracts
-            }
-          }
-          
-          // Estimate gas
-          let gasEstimate = '0.01';
-          try {
-            const value = ethers.parseEther(price || '0');
-            let gasLimit;
-            
-            if (mintFunc.hasQuantity) {
-              const specificFunction = contract.getFunction(`${mintFunc.name}(uint256)`);
-              gasLimit = await specificFunction.estimateGas(1, { value });
-            } else {
-              const specificFunction = contract.getFunction(`${mintFunc.name}()`);
-              gasLimit = await specificFunction.estimateGas({ value });
-            }
-            
-            const feeData = await provider.getFeeData();
-            const gasCost = gasLimit * (feeData.gasPrice || feeData.maxFeePerGas || BigInt(30000000000));
-            gasEstimate = ethers.formatEther(gasCost);
-            addLog(`⛽ Gas estimate: ${gasEstimate} ${chainSymbol}`, 'info');
-          } catch (e) {
-            addLog(`⚠️ Gas estimation failed, using default`, 'warning');
-          }
-          
-          scanned.push({
-            address,
-            privateKey: key,
-            balance,
-            hasMinted,
-            eligiblePhases: {
-              public: true,
-              whitelist: false,
-              allowlist: false,
-            },
-            status: hasMinted ? 'already_minted' : 'ready',
-            gasEstimate,
-          });
-          
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-        } catch (error) {
-          addLog(`❌ Error scanning wallet ${i + 1}: ${error.message}`, 'error');
-          continue;
+      const { launchpadAbi, nftAbi } = await loadAbis();
+
+      let targetAbi = null, style = 'direct0', selectedFn = null;
+
+      // Prefer router first if available
+      if(launchpadAbi){
+        const sig = detectMintSignature(launchpadAbi);
+        if(sig){
+          targetAbi = launchpadAbi; style = sig.style; selectedFn = sig.fn;
+          push('info', `Mint (launchpad): ${sig.fn.name} [${sig.style}]`);
         }
       }
-      
-      setScannedWallets(scanned);
-      setWallets(scanned);
-      setEstimatedGas(scanned[0]?.gasEstimate || '0.01');
-      addLog(`✅ Scan complete! ${scanned.length} wallet(s) ready`, 'success');
-      
-      if (scanned.length > 0) {
-        setMintPhases({ ...mintPhases, public: true });
+      // Fallback to NFT
+      if(!selectedFn && nftAbi){
+        const sig = detectMintSignature(nftAbi);
+        if(sig){ targetAbi = nftAbi; style = sig.style; selectedFn = sig.fn; push('info', `Mint (NFT): ${sig.fn.name} [${sig.style}]`); }
       }
-      
-    } catch (error) {
-      addLog(`❌ Scan failed: ${error.message}`, 'error');
-    }
-    
-    setIsScanning(false);
-  };
-  
-  const startMinting = async () => {
-    if (!ethers) {
-      addLog('❌ Ethers.js not loaded yet', 'error');
-      return;
-    }
-    
-    if (wallets.length === 0) {
-      addLog('❌ Please scan wallets first', 'error');
-      return;
-    }
-    
-    setIsMinting(true);
-    setMintStats({ success: 0, failed: 0, total: wallets.length });
-    addLog('🚀 Starting mint process...', 'info');
-    addLog(`📋 Contract type: ${contractType}`, 'info');
-    
-    const contractAddr = config.contractAddress || extractContractAddress(config.launchpadUrl);
-    const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-    const updatedWallets = [...wallets];
-    
-    let successCount = 0;
-    let failedCount = 0;
-    
-    for (let i = 0; i < updatedWallets.length; i++) {
-      const walletInfo = updatedWallets[i];
-      
-      walletInfo.status = 'minting';
-      setWallets([...updatedWallets]);
-      
-      addLog(`🔄 Minting for wallet ${i + 1}/${updatedWallets.length}: ${walletInfo.address.slice(0, 6)}...${walletInfo.address.slice(-4)}`, 'info');
-      
-      if (walletInfo.hasMinted && contractType === 'nft') {
-        walletInfo.status = 'skipped';
-        walletInfo.error = 'Already minted';
-        setWallets([...updatedWallets]);
-        addLog(`⏭️ Skipped: Already minted`, 'warning');
-        failedCount++;
-        setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-        continue;
+
+      if(!selectedFn){
+        push('error','Tidak menemukan fungsi mint/claim pada ABI. Paste ABI manual atau pastikan kontrak benar.');
+        return;
       }
-      
-      let mintSuccess = false;
-      let retryCount = 0;
-      let txHash = null;
-      let lastError = null;
-      
-      while (!mintSuccess && retryCount <= (advancedOptions.autoRetry ? 3 : 0)) {
-        if (retryCount > 0) {
-          addLog(`🔄 Retry attempt ${retryCount}/3...`, 'warning');
-        }
-        
-        try {
-          const wallet = new ethers.Wallet(walletInfo.privateKey, provider);
-          const contract = new ethers.Contract(contractAddr, contractABI, wallet);
-          
+
+      if(style === 'router' && looksAllowlistOnly(selectedFn.inputs)){
+        push('warn','Fungsi router terdeteksi tampaknya butuh allowlist proof/signature. Mode ini hanya mendukung Public Mint.');
+      }
+
+      // Prepare wallets view
+      const pks = parseKeys();
+      const list = pks.map(pk=>{
+        try{
+          const wallet = new ethers.Wallet(pk);
+          return { address: wallet.address, pk, status: 'READY', lastTx: null };
+        }catch{ return { address: 'Invalid PK', pk, status: 'ERROR_PK', lastTx: null }; }
+      });
+      setWallets(list);
+
+      // Fee preview
+      const fee = await provider.getFeeData();
+      push('info', `Fee data: maxFeePerGas=${fee.maxFeePerGas?.toString()||'n/a'}, gasPrice=${fee.gasPrice?.toString()||'n/a'}`);
+
+    }catch(err){
+      push('error', `Scan error: ${err.message}`);
+    }
+  }
+
+  function multPct(bn, pct){ return (bn * BigInt(pct)) / 100n; }
+
+  async function startMinting(){
+    if(busy) return;
+    if(!chain.chainId){ push('error','Detect chain dulu.'); return; }
+
+    setBusy(true);
+    try{
+      const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+      const qty = Math.max(1, Number(config.quantity||1));
+      const valuePer = ethers.parseEther((config.mintPriceEth||'0').toString());
+
+      const { launchpadAbi, nftAbi } = await loadAbis();
+
+      // Decide style again (robust against state changes)
+      let style = 'direct0', targetAbi = null, selectedFn = null, targetAddress = null;
+      if(launchpadAbi){ const sig = detectMintSignature(launchpadAbi); if(sig){ style=sig.style; targetAbi=launchpadAbi; selectedFn=sig.fn; targetAddress=config.launchpadContractAddress; } }
+      if(!selectedFn && nftAbi){ const sig = detectMintSignature(nftAbi); if(sig){ style=sig.style; targetAbi=nftAbi; selectedFn=sig.fn; targetAddress=config.nftContractAddress; } }
+      if(!selectedFn) throw new Error('Tidak menemukan fungsi mint/claim apapun');
+
+      // Build static args template based on style (will adjust per-wallet if needed)
+      const wantsFeeRecipient = selectedFn.inputs?.[1]?.type === 'address' && style === 'router';
+
+      // Iterate wallets
+      const pks = parseKeys();
+      for(const pk of pks){
+        let statusPrefix = '';
+        try{
+          const wallet = new ethers.Wallet(pk, provider);
+          statusPrefix = wallet.address.slice(0,8);
+
           const feeData = await provider.getFeeData();
-          let gasPrice = feeData.gasPrice || feeData.maxFeePerGas || BigInt(30000000000);
-          
-          if (config.gasLevel === 'high') {
-            gasPrice = (gasPrice * 150n) / 100n;
-          } else if (config.gasLevel === 'low') {
-            gasPrice = (gasPrice * 80n) / 100n;
+          const overrides = {};
+          if(feeData.maxFeePerGas && feeData.maxPriorityFeePerGas){
+            let mf = feeData.maxFeePerGas, mp = feeData.maxPriorityFeePerGas;
+            if(config.gasLevel==='high'){ mf = multPct(mf,120); mp = multPct(mp,120); }
+            if(config.gasLevel==='low'){  mf = multPct(mf,80);  mp = multPct(mp,80); }
+            overrides.maxFeePerGas = mf; overrides.maxPriorityFeePerGas = mp;
+          }else if(feeData.gasPrice){
+            let gp = feeData.gasPrice; if(config.gasLevel==='high') gp = multPct(gp,120); if(config.gasLevel==='low') gp = multPct(gp,80); overrides.gasPrice = gp;
           }
-          
-          addLog(`⛽ Gas price: ${ethers.formatUnits(gasPrice, 'gwei')} Gwei`, 'info');
-          
-          const mintValue = ethers.parseEther(mintPrice || '0');
-          const gasLimit = parseInt(config.customGasLimit) || 400000;
-          
-          addLog(`📤 Sending transaction with ${gasLimit} gas limit...`, 'info');
-          
-          let tx;
-          let usedFunction = mintFunctionName;
-          let usedParams = mintFunctionParams;
-          
-          try {
-            // Execute transaction based on contract type
-            if (mintFunctionHasQuantity) {
-              const specificFunction = contract.getFunction(`${mintFunctionName}(uint256)`);
-              tx = await specificFunction(parseInt(config.mintQuantity), {
-                value: mintValue,
-                gasPrice: gasPrice,
-                gasLimit: gasLimit,
-              });
-            } else {
-              const specificFunction = contract.getFunction(`${mintFunctionName}()`);
-              tx = await specificFunction({
-                value: mintValue,
-                gasPrice: gasPrice,
-                gasLimit: gasLimit,
-              });
+
+          const totalValue = valuePer * BigInt(qty);
+          overrides.value = totalValue;
+
+          // Construct args
+          let args = [];
+          if(style === 'router'){
+            if(!isAddressLike(config.launchpadContractAddress) || !isAddressLike(config.nftContractAddress)) throw new Error('Alamat router/NFT belum valid');
+            if(wantsFeeRecipient){
+              // Common: mint(address nft, address feeRecipient, uint256 quantity)
+              args = [config.nftContractAddress, wallet.address, BigInt(qty)];
+            }else{
+              // Common: mint(address nft, uint256 quantity)
+              args = [config.nftContractAddress, BigInt(qty)];
             }
-          } catch (txError) {
-            addLog(`⚠️ Primary method failed, trying alternatives...`, 'warning');
-            lastError = txError;
-            
-            // Try alternative mint functions based on contract type
-            let alternativeFunctions = [];
-            
-            if (contractType === 'nft') {
-              alternativeFunctions = [
-                { name: 'mint', params: [], payable: true },
-                { name: 'mint', params: [parseInt(config.mintQuantity)], payable: true },
-                { name: 'publicMint', params: [], payable: true },
-                { name: 'publicMint', params: [parseInt(config.mintQuantity)], payable: true },
-                { name: 'mintPublic', params: [], payable: true },
-                { name: 'claim', params: [], payable: true },
-              ];
-            } else if (contractType === 'creator') {
-              alternativeFunctions = [
-                { name: 'mint', params: [], payable: true },
-                { name: 'mint', params: [parseInt(config.mintQuantity)], payable: true },
-                { name: 'purchase', params: [], payable: true },
-                { name: 'purchase', params: [parseInt(config.mintQuantity)], payable: true },
-                { name: 'createAndMint', params: ['Test NFT', 'TEST', parseInt(config.mintQuantity), '0x'], payable: true },
-              ];
-            } else {
-              // Try both
-              alternativeFunctions = [
-                { name: 'mint', params: [], payable: true },
-                { name: 'mint', params: [parseInt(config.mintQuantity)], payable: true },
-                { name: 'publicMint', params: [], payable: true },
-                { name: 'purchase', params: [], payable: true },
-                { name: 'claim', params: [], payable: true },
-              ];
-            }
-            
-            let alternativeSuccess = false;
-            for (const alt of alternativeFunctions) {
-              try {
-                if (contract[alt.name]) {
-                  addLog(`Trying ${alt.name}(${alt.params.join(',')})...`, 'info');
-                  
-                  const txConfig = {
-                    gasPrice: gasPrice,
-                    gasLimit: gasLimit,
-                  };
-                  
-                  if (alt.payable) {
-                    txConfig.value = mintValue;
-                  }
-                  
-                  if (alt.params.length === 0) {
-                    tx = await contract[alt.name](txConfig);
-                  } else {
-                    tx = await contract[alt.name](...alt.params, txConfig);
-                  }
-                  
-                  usedFunction = alt.name;
-                  usedParams = alt.params;
-                  alternativeSuccess = true;
-                  addLog(`✅ Alternative function ${alt.name} worked!`, 'success');
-                  break;
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-            
-            if (!alternativeSuccess) {
-              throw new Error(`All mint methods failed. Contract type: ${contractType}. Possible reasons: sale not active, not eligible, or wrong contract.`);
-            }
+          }else if(style==='directQty'){
+            if(!isAddressLike(config.nftContractAddress)) throw new Error('Alamat NFT belum valid');
+            args = [BigInt(qty)];
+            targetAddress = config.nftContractAddress;
+          }else{ // direct0 or unknown
+            if(!isAddressLike(config.nftContractAddress)) throw new Error('Alamat NFT belum valid');
+            args = [];
+            targetAddress = config.nftContractAddress;
           }
-          
-          addLog(`⏳ Waiting for confirmation... TX: ${tx.hash}`, 'info');
-          txHash = tx.hash;
-          
-          const receipt = await tx.wait();
-          
-          if (receipt.status === 1) {
-            mintSuccess = true;
-            addLog(`✅ Mint successful! TX: ${tx.hash}`, 'success');
-            
-            // Verify NFT was minted for NFT contracts
-            if (contractType === 'nft' || nftContractAddress) {
-              try {
-                const verifyContract = nftContractAddress ? 
-                  new ethers.Contract(nftContractAddress, contractABI, provider) : contract;
-                const nftBalance = await verifyContract.balanceOf(walletInfo.address);
-                const newBalance = Number(nftBalance);
-                addLog(`🎉 Verified: Wallet now has ${newBalance} NFT(s)`, 'success');
-              } catch (e) {
-                addLog(`ℹ️ Could not verify NFT balance: ${e.message}`, 'info');
-              }
-            }
-          } else {
-            throw new Error('Transaction reverted by contract');
+
+          // If function looks like allowlist-only, bail with message instead of wasting gas
+          if(looksAllowlistOnly(selectedFn.inputs)){
+            push('warn', `${statusPrefix} • Fungsi tampak perlu allowlist/signature → lewati (hanya public mint didukung).`);
+            continue;
           }
-          
-        } catch (error) {
-          lastError = error;
-          addLog(`❌ Mint attempt ${retryCount + 1} failed: ${error.message}`, 'error');
-          retryCount++;
-          
-          if (retryCount > (advancedOptions.autoRetry ? 3 : 0)) {
-            break;
+
+          const contract = new ethers.Contract(targetAddress, targetAbi, wallet);
+
+          // Gas estimate v6
+          try{
+            const est = await contract.estimateGas[selectedFn.name](...args, overrides);
+            overrides.gasLimit = multPct(est, 120); // buffer 20%
+          }catch(e){
+            overrides.gasLimit = 300000n; // fallback
           }
-          
-          await new Promise(resolve => setTimeout(resolve, 2000));
+
+          const tx = await contract[selectedFn.name](...args, overrides);
+          push('info', `${statusPrefix} • sent → ${tx.hash}`);
+          const rc = await tx.wait();
+          push('success', `${statusPrefix} • confirmed in block ${rc.blockNumber} → ${getExplorerUrl(chain.chainId, tx.hash)}`);
+        }catch(err){
+          push('error', `${statusPrefix} • ${err.message || String(err)}`);
         }
       }
-      
-      if (mintSuccess) {
-        walletInfo.status = 'success';
-        walletInfo.txHash = txHash;
-        successCount++;
-        setMintStats(prev => ({ ...prev, success: prev.success + 1 }));
-      } else {
-        walletInfo.status = 'failed';
-        walletInfo.error = lastError?.message || 'Transaction failed after retries';
-        failedCount++;
-        setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-        
-        // Provide specific error guidance
-        if (lastError?.message.includes('sale not active')) {
-          addLog(`💡 Tip: The sale may not be active yet`, 'info');
-        } else if (lastError?.message.includes('whitelist')) {
-          addLog(`💡 Tip: Wallet may not be whitelisted`, 'info');
-        } else if (contractType === 'creator') {
-          addLog(`💡 Tip: This is a creator contract. The NFT may be created in a separate contract.`, 'info');
-        }
-      }
-      
-      setWallets([...updatedWallets]);
-      
-      if (i < updatedWallets.length - 1) {
-        addLog(`⏳ Waiting 2 seconds before next wallet...`, 'info');
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
+
+    }catch(err){
+      push('error', `Mint error: ${err.message}`);
+    }finally{
+      setBusy(false);
     }
-    
-    setIsMinting(false);
-    addLog('🎉 Minting process completed!', 'success');
-    addLog(`📊 Results: ${successCount} success, ${failedCount} failed out of ${updatedWallets.length}`, 'info');
-  };
-  
-  // ... (clearAll, getStatusIcon, getStatusText functions remain the same)
+  }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4">
-      <div className="max-w-6xl mx-auto">
-        <div className="bg-gradient-to-r from-purple-600 to-blue-600 rounded-t-2xl p-6 shadow-2xl">
-          <div className="flex items-center gap-3">
-            <Zap className="w-8 h-8 text-yellow-300" />
-            <div>
-              <h1 className="text-3xl font-bold text-white">OpenSea Auto Mint Bot</h1>
-              <p className="text-purple-100 text-sm">Smart contract detection for NFT & Creator contracts</p>
-            </div>
-          </div>
+    <div style={{ fontFamily: 'Inter, system-ui, sans-serif', padding: 16, maxWidth: 980, margin: '0 auto' }}>
+      <h1 style={{ fontSize: 22, fontWeight: 700 }}>Multi‑Launchpad Mint (Router‑Aware)</h1>
+      <p style={{ opacity: .8, marginTop: 4 }}>Dukung mint via kontrak Router/Creator (mis. OpenSea SeaDrop) atau langsung ke NFT jika dibolehkan.</p>
+
+      <section style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 16 }}>
+        <div>
+          <label>RPC URL</label>
+          <input value={config.rpcUrl} onChange={e=>setConfig({...config, rpcUrl:e.target.value})} placeholder="https://..." style={s.input}/>
+          <button onClick={onDetectChain} style={s.btn}>Detect Chain</button>
+          {chain.chainId!==0 && (
+            <div style={{ marginTop: 6, fontSize: 13 }}>Chain: <b>{chain.name}</b> • Symbol: {chain.symbol} • chainId: {chain.chainId}</div>
+          )}
         </div>
-        
-        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-4 mt-4">
-          <div className="flex items-start gap-2">
-            <AlertCircle className="w-5 h-5 text-yellow-500 flex-shrink-0 mt-0.5" />
-            <div className="text-sm text-yellow-200">
-              <strong>Contract Detection:</strong> Bot now automatically detects if you're using NFT contract or Creator contract and adjusts minting strategy accordingly.
-            </div>
-          </div>
+        <div>
+          <label>Explorer API Key (opsional)</label>
+          <input value={config.explorerApiKey} onChange={e=>setConfig({...config, explorerApiKey:e.target.value})} placeholder="Etherscan/Basescan/Polygonscan key" style={s.input}/>
+          <small style={{opacity:.7}}>Dipakai untuk fetch ABI. Kalau kosong, tetap dicoba (banyak kontrak publik berhasil).</small>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2 space-y-6">
-            <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                <span className="text-2xl">📝</span> Configuration
-              </h2>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    OpenSea Link / Contract Address
-                  </label>
-                  <input
-                    type="text"
-                    value={config.launchpadUrl}
-                    onChange={(e) => setConfig({ ...config, launchpadUrl: e.target.value, contractAddress: extractContractAddress(e.target.value) })}
-                    placeholder="https://opensea.io/... or 0x..."
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                  {config.contractAddress && (
-                    <p className="text-xs text-green-400 mt-1">
-                      Detected contract: {config.contractAddress}
-                    </p>
-                  )}
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    RPC URL {detectedChain && <span className="text-purple-400">({detectedChain})</span>}
-                  </label>
-                  <input
-                    type="text"
-                    value={config.rpcUrl}
-                    onChange={(e) => setConfig({ ...config, rpcUrl: e.target.value })}
-                    placeholder="https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                  />
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Private Keys (max 10, one per line)
-                  </label>
-                  <textarea
-                    value={config.privateKeys}
-                    onChange={(e) => setConfig({ ...config, privateKeys: e.target.value })}
-                    placeholder="0xabc123...&#10;0xdef456...&#10;0xghi789..."
-                    rows={4}
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">
-                    {parsePrivateKeys(config.privateKeys).length}/10 valid wallets
-                  </p>
-                </div>
-                
-                <div className="grid grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Gas Level</label>
-                    <select
-                      value={config.gasLevel}
-                      onChange={(e) => setConfig({ ...config, gasLevel: e.target.value })}
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    >
-                      <option value="low">Low (-20%)</option>
-                      <option value="normal">Normal</option>
-                      <option value="high">High (+50%)</option>
-                    </select>
-                  </div>
-                  
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Gas Limit</label>
-                    <input
-                      type="text"
-                      value={config.customGasLimit}
-                      onChange={(e) => setConfig({ ...config, customGasLimit: e.target.value })}
-                      placeholder="400000"
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    />
-                  </div>
-                  
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Quantity</label>
-                    <input
-                      type="number"
-                      value={config.mintQuantity}
-                      onChange={(e) => setConfig({ ...config, mintQuantity: e.target.value })}
-                      placeholder="1"
-                      min="1"
-                      max="10"
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    />
-                  </div>
-                </div>
-                
-                <div className="flex gap-4">
-                  <div className="flex-1"></div>
-                  <div className="flex items-end">
-                    <button
-                      onClick={scanWallets}
-                      disabled={isScanning || isMinting}
-                      className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-700 text-white px-6 py-2.5 rounded-lg font-medium flex items-center gap-2 transition-all disabled:cursor-not-allowed"
-                    >
-                      {isScanning ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Scanning...
-                        </>
-                      ) : (
-                        <>
-                          <Scan className="w-4 h-4" />
-                          Scan Wallets
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </div>
-              
-              {scannedWallets.length > 0 && (
-                <div className="mt-6 pt-6 border-t border-slate-700">
-                  <div className="flex items-center justify-between mb-3">
-                    <label className="block text-sm font-medium text-gray-300">
-                      Mint Phase Selection
-                    </label>
-                    {contractType !== 'unknown' && (
-                      <span className={`px-2 py-1 rounded text-xs font-medium ${
-                        contractType === 'nft' ? 'bg-green-500/20 text-green-400' :
-                        contractType === 'creator' ? 'bg-blue-500/20 text-blue-400' :
-                        'bg-yellow-500/20 text-yellow-400'
-                      }`}>
-                        {contractType.toUpperCase()} CONTRACT
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex flex-wrap gap-4">
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={mintPhases.public}
-                        onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Public Mint</span>
-                    </label>
-                    
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={mintPhases.whitelist}
-                        onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Whitelist Mint</span>
-                    </label>
-                    
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={mintPhases.allowlist}
-                        onChange={(e) => setMintPhases({ ...mintPhases, allowlist: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Allowlist Mint</span>
-                    </label>
-                  </div>
-                </div>
-              )}
-              
-              <div className="mt-4 pt-4 border-t border-slate-700">
-                <label className="block text-sm font-medium text-gray-300 mb-3">
-                  Advanced Options
-                </label>
-                <div className="flex flex-wrap gap-4">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={advancedOptions.autoRetry}
-                      onChange={(e) => setAdvancedOptions({ ...advancedOptions, autoRetry: e.target.checked })}
-                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                    />
-                    <span className="text-white text-sm">Auto-retry (3x)</span>
-                  </label>
-                  
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={advancedOptions.simulateTx}
-                      onChange={(e) => setAdvancedOptions({ ...advancedOptions, simulateTx: e.target.checked })}
-                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                    />
-                    <span className="text-white text-sm">Simulate TX</span>
-                  </label>
-                  
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={advancedOptions.detectCollection}
-                      onChange={(e) => setAdvancedOptions({ ...advancedOptions, detectCollection: e.target.checked })}
-                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                    />
-                    <span className="text-white text-sm">Detect Collection</span>
-                  </label>
-                </div>
-              </div>
-              
-              <div className="mt-6 flex gap-3">
-                <button
-                  onClick={startMinting}
-                  disabled={isMinting || wallets.length === 0}
-                  className="flex-1 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 disabled:from-gray-600 disabled:to-gray-700 text-white py-3 rounded-lg font-semibold flex items-center justify-center gap-2 transition-all disabled:cursor-not-allowed"
-                >
-                  {isMinting ? (
-                    <>
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      Minting...
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="w-5 h-5" />
-                      Start Auto Mint
-                    </>
-                  )}
-                </button>
-                
-                <button
-                  onClick={clearAll}
-                  disabled={isMinting || isScanning}
-                  className="px-6 bg-slate-700 hover:bg-slate-600 disabled:bg-gray-700 text-white py-3 rounded-lg font-semibold transition-all disabled:cursor-not-allowed"
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-            
-            {/* Wallet Status component remains the same */}
-            {wallets.length > 0 && (
-              <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                  <span className="text-2xl">📊</span> Wallet Status ({wallets.length} wallets)
-                </h2>
-                
-                <div className="space-y-2">
-                  {wallets.map((wallet, idx) => (
-                    <div key={idx} className="bg-slate-700/30 rounded-lg p-4 flex items-center justify-between">
-                      <div className="flex items-center gap-3 flex-1">
-                        {getStatusIcon(wallet.status)}
-                        <div className="flex-1">
-                          <p className="text-white font-mono text-sm">
-                            {wallet.address.slice(0, 6)}...{wallet.address.slice(-4)}
-                          </p>
-                          <p className="text-gray-400 text-xs">Balance: {wallet.balance} {chainSymbol}</p>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <p className={`text-sm font-medium ${
-                          wallet.status === 'success' ? 'text-green-400' :
-                          wallet.status === 'failed' ? 'text-red-400' :
-                          wallet.status === 'minting' ? 'text-blue-400' :
-                          wallet.status === 'skipped' ? 'text-yellow-400' :
-                          'text-gray-400'
-                        }`}>
-                          {getStatusText(wallet)}
-                        </p>
-                        {wallet.txHash && (
-                          <a
-                            href={`https://etherscan.io/tx/${wallet.txHash}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-xs text-purple-400 hover:text-purple-300 flex items-center gap-1 justify-end"
-                          >
-                            View TX <ExternalLink className="w-3 h-3" />
-                          </a>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                
-                {mintStats.total > 0 && (
-                  <div className="mt-4 pt-4 border-t border-slate-700 grid grid-cols-3 gap-4">
-                    <div className="text-center">
-                      <p className="text-2xl font-bold text-green-400">{mintStats.success}</p>
-                      <p className="text-xs text-gray-400">Success</p>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-2xl font-bold text-red-400">{mintStats.failed}</p>
-                      <p className="text-xs text-gray-400">Failed</p>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-2xl font-bold text-purple-400">{mintStats.total}</p>
-                      <p className="text-xs text-gray-400">Total</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-          
-          <div className="space-y-6">
-            {scannedWallets.length > 0 && (
-              <>
-                <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                  <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                    <span className="text-2xl">💰</span> Mint Info
-                  </h2>
-                  
-                  <div className="space-y-3">
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Contract Type:</span>
-                      <span className={`font-semibold ${
-                        contractType === 'nft' ? 'text-green-400' :
-                        contractType === 'creator' ? 'text-blue-400' :
-                        'text-yellow-400'
-                      }`}>
-                        {contractType.toUpperCase()}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Mint Price:</span>
-                      <span className="text-white font-semibold">{mintPrice} {chainSymbol}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Est. Gas:</span>
-                      <span className="text-white font-semibold">{estimatedGas} {chainSymbol}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">Quantity:</span>
-                      <span className="text-white font-semibold">{config.mintQuantity}</span>
-                    </div>
-                    <div className="flex justify-between pt-2 border-t border-slate-700">
-                      <span className="text-gray-400">Total Cost:</span>
-                      <span className="text-purple-400 font-bold">
-                        {(parseFloat(mintPrice) + parseFloat(estimatedGas)).toFixed(4)} {chainSymbol}
-                      </span>
-                    </div>
-                    {detectedChain && (
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">Chain:</span>
-                        <span className="text-white font-semibold">{detectedChain}</span>
-                      </div>
-                    )}
-                    {mintFunctionName && (
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">Mint Function:</span>
-                        <span className="text-white font-mono text-sm">
-                          {mintFunctionName}({mintFunctionHasQuantity ? 'uint256' : ''})
-                        </span>
-                      </div>
-                    )}
-                    {nftContractAddress && (
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">NFT Contract:</span>
-                        <span className="text-white font-mono text-sm">
-                          {nftContractAddress.slice(0, 6)}...{nftContractAddress.slice(-4)}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </div>
+        <div>
+          <label>Launchpad / Router Address</label>
+          <input value={config.launchpadContractAddress} onChange={e=>setConfig({...config, launchpadContractAddress:e.target.value.trim()})} placeholder="0x... (SeaDrop/Creator/Router)" style={s.input}/>
+        </div>
+        <div>
+          <label>NFT Contract Address</label>
+          <input value={config.nftContractAddress} onChange={e=>setConfig({...config, nftContractAddress:e.target.value.trim()})} placeholder="0x... (ERC721/1155)" style={s.input}/>
+        </div>
 
-                {Object.keys(contractDetails).length > 0 && (
-                  <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                    <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                      <span className="text-2xl">📋</span> Contract Details
-                    </h2>
-                    
-                    <div className="space-y-3">
-                      {contractDetails.name && (
-                        <div className="flex justify-between">
-                          <span className="text-gray-400">Name:</span>
-                          <span className="text-white font-semibold">{contractDetails.name}</span>
-                        </div>
-                      )}
-                      {contractDetails.symbol && (
-                        <div className="flex justify-between">
-                          <span className="text-gray-400">Symbol:</span>
-                          <span className="text-white font-semibold">{contractDetails.symbol}</span>
-                        </div>
-                      )}
-                      {contractDetails.saleStatus && (
-                        <div className="flex justify-between">
-                          <span className="text-gray-400">Sale Status:</span>
-                          <span className={`font-semibold ${
-                            contractDetails.saleStatus.status === 'true' || contractDetails.saleStatus.status === '1' 
-                              ? 'text-green-400' 
-                              : 'text-red-400'
-                          }`}>
-                            {contractDetails.saleStatus.status === 'true' || contractDetails.saleStatus.status === '1' ? 'Active' : 'Inactive'}
-                          </span>
-                        </div>
-                      )}
-                      {contractDetails.totalSupply && (
-                        <div className="flex justify-between">
-                          <span className="text-gray-400">Total Supply:</span>
-                          <span className="text-white font-semibold">{contractDetails.totalSupply}</span>
-                        </div>
-                      )}
-                      {contractDetails.maxSupply && (
-                        <div className="flex justify-between">
-                          <span className="text-gray-400">Max Supply:</span>
-                          <span className="text-white font-semibold">{contractDetails.maxSupply}</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
-            
-            <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                <span className="text-2xl">📜</span> Live Logs
-              </h2>
-              
-              <div className="bg-slate-900/50 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs">
-                {logs.length === 0 ? (
-                  <p className="text-gray-500 text-center py-8">No logs yet. Start by scanning wallets.</p>
-                ) : (
-                  <div className="space-y-1">
-                    {logs.map((log, idx) => (
-                      <div key={idx} className="flex gap-2">
-                        <span className="text-gray-500 flex-shrink-0">[{log.timestamp}]</span>
-                        <span className={
-                          log.type === 'error' ? 'text-red-400' :
-                          log.type === 'success' ? 'text-green-400' :
-                          log.type === 'warning' ? 'text-yellow-400' :
-                          'text-gray-300'
-                        }>
-                          {log.message}
-                        </span>
-                      </div>
-                    ))}
-                    <div ref={logsEndRef} />
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
+        <div>
+          <label>Private Keys (satu per baris)</label>
+          <textarea value={config.privateKeys} onChange={e=>setConfig({...config, privateKeys:e.target.value})} placeholder="0xabc...\n0xdef..." style={s.ta}/>
         </div>
-        
-        <div className="mt-6 text-center text-gray-400 text-sm pb-4">
-          <p>⚠️ This is a real minting tool. Transactions are irreversible. Use at your own risk.</p>
-          <p className="mt-1">Always verify contract addresses and test with small amounts first.</p>
-          <p className="mt-2">Made with 💜 for the NFT community</p>
+        <div>
+          <label>Mint Price per mint (ETH)</label>
+          <input value={config.mintPriceEth} onChange={e=>setConfig({...config, mintPriceEth:e.target.value})} placeholder="0" style={s.input}/>
+          <label style={{marginTop:8}}>Quantity per wallet</label>
+          <input type="number" min={1} value={config.quantity} onChange={e=>setConfig({...config, quantity: Number(e.target.value)})} style={s.input}/>
+          <label style={{marginTop:8}}>Gas Level</label>
+          <select value={config.gasLevel} onChange={e=>setConfig({...config, gasLevel:e.target.value})} style={s.input}>
+            <option value="low">Low (−20%)</option>
+            <option value="normal">Normal</option>
+            <option value="high">High (+20%)</option>
+          </select>
         </div>
+
+        <div>
+          <label>Manual ABI — Launchpad/Router (opsional)</label>
+          <textarea value={config.manualLaunchpadAbi} onChange={e=>setConfig({...config, manualLaunchpadAbi:e.target.value})} placeholder="Paste JSON ABI kalau fetch gagal" style={s.taSmall}/>
+        </div>
+        <div>
+          <label>Manual ABI — NFT (opsional)</label>
+          <textarea value={config.manualNftAbi} onChange={e=>setConfig({...config, manualNftAbi:e.target.value})} placeholder="Paste JSON ABI kalau fetch gagal" style={s.taSmall}/>
+        </div>
+      </section>
+
+      <div style={{ display:'flex', gap:8, marginTop: 10 }}>
+        <button onClick={scan} disabled={!canScan} style={s.btn}>Scan</button>
+        <button onClick={startMinting} disabled={busy} style={s.btnPrimary}>{busy? 'Minting...' : 'Start Minting'}</button>
       </div>
+
+      <section style={{ marginTop: 16 }}>
+        <h3 style={{ fontSize:16, fontWeight:700 }}>Wallets</h3>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:6 }}>
+          {wallets.map((w, i)=> (
+            <div key={i} style={s.card}>
+              <div style={{fontFamily:'ui-monospace, SFMono-Regular',fontSize:12}}>{w.address}</div>
+              {w.lastTx && (
+                <a href={getExplorerUrl(chain.chainId, w.lastTx)} rel="noreferrer" target="_blank">View TX →</a>
+              )}
+              <div style={{fontSize:12, opacity:.7}}>Status: {w.status}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section style={{ marginTop: 16 }}>
+        <h3 style={{ fontSize:16, fontWeight:700 }}>Logs</h3>
+        <div style={s.logBox}>
+          {logs.map((l, i)=> (
+            <div key={i} style={{ padding:'6px 8px', borderBottom:'1px solid #eee' }}>
+              <span style={{ fontFamily:'ui-monospace, SFMono-Regular', fontSize:11, opacity:.6 }}>{new Date(l.ts).toLocaleTimeString()}</span>
+              <span style={{ marginLeft:8, fontWeight:600, textTransform:'uppercase', fontSize:11, color: colorFor(l.type) }}>{l.type}</span>
+              <div style={{ marginTop:2 }}>{linkify(l.message)}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <footer style={{ margin:'24px 0', fontSize:12, opacity:.7 }}>
+        ⚠️ Hanya mendukung Public Mint. Jika fungsi membutuhkan allowlist proof/signature, aplikasi akan melewatinya.
+      </footer>
     </div>
   );
+}
+
+const colorFor = (t)=> t==='error'?'#c62828': t==='success'?'#2e7d32': t==='warn'?'#f9a825':'#1976d2';
+
+const linkify = (text='')=>{
+  const url = /(https?:\/\/[^\s]+)/g; 
+  const parts = String(text).split(url);
+  return parts.map((p,i)=> url.test(p) ? <a key={i} href={p} target="_blank" rel="noreferrer">{p}</a> : <span key={i}>{p}</span>);
 };
 
-export default OpenSeaAutoMint;
+const s = {
+  input: { width:'100%', padding:'8px 10px', border:'1px solid #ddd', borderRadius:8, marginTop:4 },
+  ta: { width:'100%', minHeight:140, padding:10, border:'1px solid #ddd', borderRadius:8, marginTop:4, fontFamily:'ui-monospace, SFMono-Regular' },
+  taSmall: { width:'100%', minHeight:90, padding:10, border:'1px solid #ddd', borderRadius:8, marginTop:4, fontFamily:'ui-monospace, SFMono-Regular' },
+  btn: { padding:'8px 12px', border:'1px solid #ddd', borderRadius:10, background:'#fff', cursor:'pointer' },
+  btnPrimary: { padding:'8px 12px', border:'1px solid #0059ff', borderRadius:10, background:'#0d6efd', color:'#fff', cursor:'pointer' },
+  card: { border:'1px solid #eee', borderRadius:10, padding:10, background:'#fafafa' },
+  logBox: { border:'1px solid #eee', borderRadius:10, maxHeight:320, overflow:'auto' },
+};
