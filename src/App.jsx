@@ -428,31 +428,26 @@ const OpenSeaAutoMint = () => {
           
           addLog(`📤 Sending transaction...`, 'info');
           
-          // Handle function overloading by specifying full signature
           let tx;
           try {
             if (mintFunctionHasQuantity) {
-              // For functions with quantity parameter, use full signature
               const mintWithQuantity = contract.getFunction(`${mintFunctionName}(uint256)`);
               tx = await mintWithQuantity(1, {
                 value: mintValue,
                 gasPrice: gasPrice,
-                gasLimit: 300000, // Set manual gas limit to avoid estimation
+                gasLimit: 300000,
               });
             } else {
-              // For functions without parameters, use full signature
               const mintWithoutParams = contract.getFunction(`${mintFunctionName}()`);
               tx = await mintWithoutParams({
                 value: mintValue,
                 gasPrice: gasPrice,
-                gasLimit: 300000, // Set manual gas limit to avoid estimation
+                gasLimit: 300000,
               });
             }
           } catch (txError) {
-            // If specific function fails, try generic mint call
             addLog(`⚠️ Trying alternative mint method...`, 'warning');
             
-            // Try all possible mint variations
             const mintVariations = [
               { fn: 'mint', params: [] },
               { fn: 'publicMint', params: [] },
@@ -676,6 +671,22 @@ const OpenSeaAutoMint = () => {
                     onChange={(e) => setConfig({ ...config, rpcUrl: e.target.value })}
                     placeholder="https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
                     className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                  <p className="text-xs text-gray-400 mt-1">
+                    Get free RPC from: Alchemy, Infura, QuickNode, or public RPCs
+                  </p>
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    Private Keys (max 10, one per line, must start with 0x)
+                  </label>
+                  <textarea
+                    value={config.privateKeys}
+                    onChange={(e) => setConfig({ ...config, privateKeys: e.target.value })}
+                    placeholder="0xabc123...&#10;0xdef456...&#10;0xghi789..."
+                    rows={4}
+                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm"
                   />
                   <p className="text-xs text-gray-400 mt-1">
                     {parsePrivateKeys(config.privateKeys).length}/10 valid wallets
@@ -967,20 +978,4 @@ const OpenSeaAutoMint = () => {
   );
 };
 
-export default OpenSeaAutoMint; mt-1">
-                    Get free RPC from: Alchemy, Infura, QuickNode, or public RPCs
-                  </p>
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Private Keys (max 10, one per line, must start with 0x)
-                  </label>
-                  <textarea
-                    value={config.privateKeys}
-                    onChange={(e) => setConfig({ ...config, privateKeys: e.target.value })}
-                    placeholder="0xabc123...&#10;0xdef456...&#10;0xghi789..."
-                    rows={4}
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm"
-                  />
-                  <p className="text-xs text-gray-400
+export default OpenSeaAutoMint;
