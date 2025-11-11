@@ -118,23 +118,32 @@ const OpenSeaAutoMint = () => {
     }
   };
   
-  const getGenericABI = () => {
+ const getGenericABI = () => {
     return [
       "function mint() public payable",
       "function publicMint() public payable",
       "function mint(uint256 quantity) public payable",
       "function publicMint(uint256 quantity) public payable",
+      "function mint(address to, uint256 quantity) public payable",
+      "function mintTo(address to, uint256 quantity) public payable",
+      "function safeMint(uint256 quantity) public payable",
+      "function purchase(uint256 quantity) public payable",
+      "function buy(uint256 quantity) public payable",
+      "function claim() public payable",
+      "function claim(uint256 quantity) public payable",
       "function whitelistMint(bytes32[] proof) public payable",
       "function allowlistMint(bytes32[] proof, uint256 quantity) public payable",
       "function mintWithSignature(bytes signature, uint256 quantity) public payable",
       "function mintPrice() public view returns (uint256)",
       "function cost() public view returns (uint256)",
       "function price() public view returns (uint256)",
+      "function getPrice() public view returns (uint256)",
       "function totalSupply() public view returns (uint256)",
       "function maxSupply() public view returns (uint256)",
       "function balanceOf(address owner) public view returns (uint256)",
       "function paused() public view returns (bool)",
       "function publicSaleActive() public view returns (bool)",
+      "function saleIsActive() public view returns (bool)",
     ];
   };
   
