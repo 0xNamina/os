@@ -1,17 +1,37 @@
+// App.jsx — OpenSea Launchpad (SeaDrop) Mint Bot, fixed & enhanced
 import React, { useState, useRef, useEffect } from 'react';
 import { Loader2, CheckCircle, XCircle, Clock, AlertCircle, Scan, Zap } from 'lucide-react';
 
+// expects ethers exposed on window (CDN). Supports v5 & v6
 const ethers = window.ethers;
 
 const OpenSeaAutoMint = () => {
   const [config, setConfig] = useState({
     launchpadUrl: '',
+    contractAddress: '',
     rpcUrl: '',
     privateKeys: '',
     gasLevel: 'normal',
+    useSeaDrop: true, // NEW: enable SeaDrop (OpenSea Launchpad)
+    seaDropAddress: '0x00005EA00Ac477B1030CE78506496e8C2dE24bf5', // default canonical
+    feeRecipient: '', // optional; will auto-resolve if blank
+    quantityPerWallet: 1,
   });
-  
+
+  const [mintPhases, setMintPhases] = useState({
+    public: true,
+    whitelist: false,
+    allowlist: false,
+  });
+
+  const [advancedOptions, setAdvancedOptions] = useState({
+    autoRetry: true,
+    sniperMode: false,
+    flashbots: false,
+  });
+
   const [wallets, setWallets] = useState([]);
+  const [scannedWallets, setScannedWallets] = useState([]);
   const [logs, setLogs] = useState([]);
   const [isScanning, setIsScanning] = useState(false);
   const [isMinting, setIsMinting] = useState(false);
@@ -20,342 +40,609 @@ const OpenSeaAutoMint = () => {
   const [estimatedGas, setEstimatedGas] = useState('0');
   const [detectedChain, setDetectedChain] = useState('');
   const [chainSymbol, setChainSymbol] = useState('ETH');
+  const [chainId, setChainId] = useState(1);
+
   const [contractABI, setContractABI] = useState(null);
   const [mintFunctionName, setMintFunctionName] = useState('');
-  const [allContracts, setAllContracts] = useState([]);
-  const [selectedContractIdx, setSelectedContractIdx] = useState(0);
-  const [autoRetry, setAutoRetry] = useState(false);
-  
+  const [mintFunctionHasQuantity, setMintFunctionHasQuantity] = useState(false);
+
   const logsEndRef = useRef(null);
-  
-  const scrollToBottom = () => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+
+  // ---------- helpers: v5/v6 compatibility ----------
+  const isV6 = (() => {
+    try { return ethers?.version?.startsWith?.('6'); } catch { return false; }
+  })();
+
+  const makeProvider = (url) =>
+    isV6 ? new ethers.JsonRpcProvider(url) : new ethers.providers.JsonRpcProvider(url);
+
+  const toWei = (ethStr) =>
+    isV6 ? ethers.parseEther(ethStr) : ethers.utils.parseEther(ethStr);
+
+  const fmtEth = (wei) =>
+    isV6 ? ethers.formatEther(wei) : ethers.utils.formatEther(wei);
+
+  const getGasPrice = async (provider) => {
+    const fee = await provider.getFeeData();
+    // Normalize to bigint
+    if (isV6) {
+      return fee.gasPrice ?? 0n;
+    }
+    return BigInt(fee.gasPrice?.toString() || '0');
   };
-  
-  useEffect(() => {
-    scrollToBottom();
-  }, [logs]);
-  
+
+  const getBalance = async (provider, addr) => {
+    const bal = await provider.getBalance(addr);
+    return isV6 ? fmtEth(bal) : fmtEth(bal);
+  };
+
+  const bnToBigInt = (x) => {
+    if (typeof x === 'bigint') return x;
+    // ethers v5 BigNumber
+    return BigInt(x.toString());
+  };
+
+  const multiplyBigInt = (a, b) => (a * b); // both bigint
+
   const addLog = (message, type = 'info') => {
     const timestamp = new Date().toLocaleTimeString();
     setLogs(prev => [...prev, { timestamp, message, type }]);
   };
-  
+
+  const scrollToBottom = () => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+  useEffect(() => { scrollToBottom(); }, [logs]);
+
   const parsePrivateKeys = (keys) => {
     return keys.split('\n')
       .map(k => k.trim())
       .filter(k => k.length > 0 && k.startsWith('0x'))
       .slice(0, 10);
   };
-  
-  const extractContractAddresses = (url) => {
-    const addresses = url.match(/0x[a-fA-F0-9]{40}/g);
-    return addresses ? [...new Set(addresses)] : [];
+
+  const extractContractAddress = (url) => {
+    const match = String(url || '').match(/0x[a-fA-F0-9]{40}/);
+    return match ? match[0] : url;
   };
-  
-  const getChainInfo = (chainId) => {
-    const chains = {
-      1: { name: 'Ethereum', symbol: 'ETH' },
-      137: { name: 'Polygon', symbol: 'MATIC' },
-      42161: { name: 'Arbitrum', symbol: 'ETH' },
-      8453: { name: 'Base', symbol: 'ETH' },
-      33139: { name: 'APE Chain', symbol: 'APE' },
-      56: { name: 'BSC', symbol: 'BNB' },
+
+  const detectChainFromRPC = async (rpcUrl) => {
+    try {
+      const provider = makeProvider(rpcUrl);
+      const network = await provider.getNetwork();
+      const cid = Number(isV6 ? network.chainId : network.chainId);
+      const chains = {
+        1: { name: 'Ethereum Mainnet', symbol: 'ETH' },
+        5: { name: 'Goerli Testnet', symbol: 'ETH' },
+        11155111: { name: 'Sepolia Testnet', symbol: 'ETH' },
+        137: { name: 'Polygon', symbol: 'MATIC' },
+        80001: { name: 'Mumbai Testnet', symbol: 'MATIC' },
+        42161: { name: 'Arbitrum One', symbol: 'ETH' },
+        10: { name: 'Optimism', symbol: 'ETH' },
+        8453: { name: 'Base', symbol: 'ETH' },
+        43114: { name: 'Avalanche', symbol: 'AVAX' },
+        56: { name: 'BSC', symbol: 'BNB' },
+      };
+      const c = chains[cid] || { name: `Chain ID: ${cid}`, symbol: 'ETH' };
+      return { name: c.name, symbol: c.symbol, chainId: cid };
+    } catch (error) {
+      addLog(`❌ Failed to detect chain: ${error.message}`, 'error');
+      return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0 };
+    }
+  };
+
+  // --- ABI helpers (kept generic if not using SeaDrop) ---
+  const getContractABI = async (contractAddress, chainId) => {
+    const apiKeys = {
+      1: '', 137: '', 5: '', 11155111: '', 80001: '', 42161: '', 10: '', 8453: '', 56: ''
     };
-    return chains[chainId] || { name: 'Unknown', symbol: 'ETH' };
+    const apiUrls = {
+      1: 'https://api.etherscan.io/api',
+      5: 'https://api-goerli.etherscan.io/api',
+      11155111: 'https://api-sepolia.etherscan.io/api',
+      137: 'https://api.polygonscan.com/api',
+      80001: 'https://api-testnet.polygonscan.com/api',
+      42161: 'https://api.arbiscan.io/api',
+      10: 'https://api-optimistic.etherscan.io/api',
+      8453: 'https://api.basescan.org/api',
+      56: 'https://api.bscscan.com/api',
+    };
+    const apiUrl = apiUrls[chainId];
+    if (!apiUrl) return genericAbi();
+    try {
+      const res = await fetch(`${apiUrl}?module=contract&action=getabi&address=${contractAddress}&apikey=${apiKeys[chainId] || ''}`);
+      const data = await res.json();
+      if (data.status === '1' && data.result) return JSON.parse(data.result);
+    } catch {
+      addLog(`⚠️ Could not fetch ABI, using generic ERC721 ABI`, 'warning');
+    }
+    return genericAbi();
   };
-  
+
+  const genericAbi = () => ([
+    "function mint() payable",
+    "function publicMint() payable",
+    "function mint(uint256 quantity) payable",
+    "function publicMint(uint256 quantity) payable",
+    "function whitelistMint() payable",
+    "function allowlistMint() payable",
+    "function mintPrice() view returns (uint256)",
+    "function cost() view returns (uint256)",
+    "function price() view returns (uint256)",
+    "function balanceOf(address owner) view returns (uint256)"
+  ]);
+
+  const detectMintFunction = (abi) => {
+    const arr = Array.isArray(abi) ? abi : [];
+    const funcs = arr.filter(i => i?.type === 'function' || typeof i === 'string');
+    const pickByName = (name, params = 0) => {
+      const found = funcs.find(f => {
+        if (typeof f === 'string') return f.toLowerCase().startsWith(`${name.toLowerCase()}(`) && (params === 0 ? !f.includes('uint256') : f.includes('uint256'));
+        return f?.name === name && ((f?.inputs?.length || 0) === params);
+      });
+      return found;
+    };
+    let f = pickByName('publicMint', 0) || pickByName('mint', 0) || pickByName('whitelistMint', 0) || pickByName('allowlistMint', 0) || pickByName('claim', 0);
+    if (f) return { name: typeof f === 'string' ? f.split('(')[0] : f.name, hasQuantity: false };
+    // with quantity
+    const fq = funcs.find(f => (typeof f === 'string' && /uint256\)/i.test(f)) || (f?.inputs?.length === 1 && f.inputs[0].type === 'uint256'));
+    if (fq) return { name: typeof fq === 'string' ? fq.split('(')[0] : fq.name, hasQuantity: true };
+    return { name: 'mint', hasQuantity: false };
+  };
+
+  // --- SeaDrop ABI (minimal subset) ---
+  const seaDropAbi = [
+    "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
+    "function getPublicDrop(address nftContract) view returns (tuple(uint80 mintPrice,uint48 startTime,uint48 endTime,uint16 maxTotalMintableByWallet,uint16 feeBps,bool restrictFeeRecipients))",
+    "function getCreatorPayoutAddress(address nftContract) view returns (address)",
+    "function getFeeRecipientIsAllowed(address nftContract, address feeRecipient) view returns (bool)"
+  ];
+
+  const getSeaDropMintPrice = async (provider, seaDropAddr, nftContractAddr) => {
+    try {
+      const seaDrop = isV6
+        ? new ethers.Contract(seaDropAddr, seaDropAbi, provider)
+        : new ethers.Contract(seaDropAddr, seaDropAbi, provider);
+      const pub = await seaDrop.getPublicDrop(nftContractAddr);
+      // ethers v6 returns object with bigint fields; v5 returns array-like BN
+      const priceWei = isV6 ? BigInt(pub.mintPrice ?? pub[0]) : BigInt(pub[0].toString());
+      return fmtEth(priceWei);
+    } catch (e) {
+      addLog(`⚠️ Could not read SeaDrop public price, fallback 0: ${e.message}`, 'warning');
+      return '0';
+    }
+  };
+
+  const resolveSeaDropFeeRecipient = async (provider, seaDropAddr, nftContractAddr, userInput) => {
+    try {
+      const seaDrop = new ethers.Contract(seaDropAddr, seaDropAbi, provider);
+      if (userInput && userInput.startsWith('0x')) {
+        const allowed = await seaDrop.getFeeRecipientIsAllowed(nftContractAddr, userInput);
+        if (allowed) return userInput;
+      }
+      // fallback to creator payout
+      const payout = await seaDrop.getCreatorPayoutAddress(nftContractAddr);
+      const allowed = await seaDrop.getFeeRecipientIsAllowed(nftContractAddr, payout);
+      if (allowed) return payout;
+    } catch {}
+    // if all else fails, 0x0 (SeaDrop usually allows multiple recipients or unrestricted)
+    return '0x0000000000000000000000000000000000000000';
+  };
+
+  const getMintPriceGeneric = async (provider, contractAddress, abi) => {
+    try {
+      const c = new ethers.Contract(contractAddress, abi, provider);
+      const getters = ['mintPrice', 'cost', 'price', 'getMintPrice'];
+      for (const g of getters) {
+        try {
+          const p = await c[g]();
+          const v = isV6 ? p : p; // both ok for fmtEth
+          return fmtEth(v);
+        } catch {}
+      }
+      return '0';
+    } catch {
+      addLog(`⚠️ Could not fetch mint price, assuming free mint`, 'warning');
+      return '0';
+    }
+  };
+
   const scanWallets = async () => {
     if (!ethers) {
-      addLog('Ethers.js not loaded', 'error');
+      addLog('❌ Ethers.js not loaded yet, please refresh page', 'error');
       return;
     }
-    
     if (!config.rpcUrl || !config.privateKeys) {
-      addLog('Please fill RPC URL and Private Keys', 'error');
+      addLog('❌ Please fill RPC URL and Private Keys', 'error');
       return;
     }
-    
-    const contractAddresses = extractContractAddresses(config.launchpadUrl);
-    if (contractAddresses.length === 0) {
-      addLog('No valid contract addresses found', 'error');
+    const contractAddr = config.contractAddress || extractContractAddress(config.launchpadUrl);
+    if (!contractAddr || !contractAddr.startsWith('0x') || contractAddr.length !== 42) {
+      addLog('❌ Invalid contract address', 'error');
       return;
     }
-    
+
     setIsScanning(true);
-    addLog('Starting wallet scan', 'info');
-    addLog(`Found ${contractAddresses.length} contracts`, 'info');
-    
+    addLog('🔍 Starting wallet scan...', 'info');
+
     const keys = parsePrivateKeys(config.privateKeys);
     if (keys.length === 0) {
-      addLog('No valid private keys found', 'error');
+      addLog('❌ No valid private keys found (must start with 0x)', 'error');
       setIsScanning(false);
       return;
     }
-    
-    addLog(`Found ${keys.length} wallets`, 'info');
-    
+    addLog(`📝 Found ${keys.length} wallet(s) to scan`, 'info');
+
     try {
-      const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-      addLog('Connected to RPC', 'info');
-      
-      const network = await provider.getNetwork();
-      const chainId = Number(network.chainId);
-      const chainInfo = getChainInfo(chainId);
-      
+      const provider = makeProvider(config.rpcUrl);
+      addLog('🔗 Connected to RPC...', 'info');
+
+      const chainInfo = await detectChainFromRPC(config.rpcUrl);
       setDetectedChain(chainInfo.name);
       setChainSymbol(chainInfo.symbol);
-      addLog(`Chain: ${chainInfo.name} (${chainInfo.symbol})`, 'info');
-      
-      const scannedContracts = [];
-      
-      for (const contractAddr of contractAddresses) {
-        addLog(`Scanning contract: ${contractAddr.slice(0, 10)}...`, 'info');
-        
-        const contractScanned = [];
-        
-        for (let i = 0; i < keys.length; i++) {
+      setChainId(chainInfo.chainId);
+      addLog(`🔗 Chain: ${chainInfo.name} (${chainInfo.symbol})`, 'info');
+
+      // price + ABI source
+      let price = '0';
+
+      if (config.useSeaDrop) {
+        addLog('📄 Using SeaDrop (OpenSea Launchpad) mode', 'info');
+        const seaPrice = await getSeaDropMintPrice(provider, config.seaDropAddress, contractAddr);
+        price = seaPrice;
+        setContractABI(seaDropAbi);
+        setMintFunctionName('mintPublic');
+        setMintFunctionHasQuantity(true);
+        addLog(`🎯 Detected SeaDrop.mintPublic(uint256 quantity)`, 'info');
+      } else {
+        addLog('📄 Fetching contract ABI...', 'info');
+        const abi = await getContractABI(contractAddr, chainInfo.chainId);
+        setContractABI(abi);
+        const mintFunc = detectMintFunction(abi);
+        setMintFunctionName(mintFunc.name);
+        setMintFunctionHasQuantity(mintFunc.hasQuantity);
+        addLog(`🎯 Detected mint function: ${mintFunc.name}(${mintFunc.hasQuantity ? 'uint256 quantity' : ''})`, 'info');
+
+        addLog('💰 Fetching mint price...', 'info');
+        price = await getMintPriceGeneric(provider, contractAddr, abi);
+      }
+
+      setMintPrice(price);
+      addLog(`💰 Mint Price: ${price} ${chainInfo.symbol}`, 'info');
+
+      // scan wallets
+      const scanned = [];
+      // If use SeaDrop, instantiate SeaDrop & NFT contract for checks
+      const nftContract = new ethers.Contract(contractAddr, ["function balanceOf(address) view returns (uint256)"], provider);
+
+      for (let i = 0; i < keys.length; i++) {
+        try {
           const key = keys[i];
-          
+          const wallet = isV6 ? new ethers.Wallet(key, provider) : new ethers.Wallet(key, provider);
+          const address = wallet.address;
+
+          addLog(`Scanning wallet ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
+
+          const balance = await getBalance(provider, address);
+
+          let hasMinted = false;
           try {
-            const wallet = new ethers.Wallet(key, provider);
-            const address = wallet.address;
-            
-            addLog(`Wallet ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
-            
-            const balanceWei = await provider.getBalance(address);
-            const balance = ethers.formatEther(balanceWei);
-            
-            contractScanned.push({
-              address,
-              privateKey: key,
-              balance,
-              status: 'ready',
-              gasEstimate: '0.002',
-            });
-            
-            await new Promise(resolve => setTimeout(resolve, 200));
-            
-          } catch (error) {
-            addLog(`Error scanning wallet: ${error.message}`, 'error');
+            const nftBalance = await nftContract.balanceOf(address);
+            hasMinted = Number(isV6 ? nftBalance : nftBalance.toString()) > 0;
+          } catch {
+            hasMinted = false;
           }
+
+          // gas estimate (rough)
+          let gasEstimateEth = '0.002';
+          try {
+            const gasPrice = await getGasPrice(provider);
+            let gasLimitBI = 300000n;
+
+            if (config.useSeaDrop) {
+              const seaDrop = new ethers.Contract(config.seaDropAddress, seaDropAbi, wallet);
+              const q = BigInt(config.quantityPerWallet || 1);
+              const value = toWei(price);
+              const args = [contractAddr, '0x0000000000000000000000000000000000000000', address, Number(q)];
+              // estimateGas patterns for v5/v6:
+              let est;
+              if (isV6) {
+                est = await seaDrop.mintPublic.estimateGas(...args, { value });
+              } else {
+                est = await seaDrop.estimateGas.mintPublic(...args, { value });
+              }
+              gasLimitBI = bnToBigInt(est);
+            } else if (contractABI) {
+              const c = new ethers.Contract(contractAddr, contractABI, wallet);
+              const value = toWei(price);
+              let est;
+              if (mintFunctionHasQuantity) {
+                if (isV6) {
+                  est = await c[mintFunctionName].estimateGas(1, { value });
+                } else {
+                  est = await c.estimateGas[mintFunctionName](1, { value });
+                }
+              } else {
+                if (isV6) {
+                  est = await c[mintFunctionName].estimateGas({ value });
+                } else {
+                  est = await c.estimateGas[mintFunctionName]({ value });
+                }
+              }
+              gasLimitBI = bnToBigInt(est);
+            }
+
+            const gasCost = multiplyBigInt(gasLimitBI, gasPrice || 0n);
+            gasEstimateEth = fmtEth(gasCost);
+          } catch {
+            // keep default
+          }
+
+          scanned.push({
+            address,
+            privateKey: key,
+            balance,
+            hasMinted,
+            eligiblePhases: { public: true, whitelist: false, allowlist: false },
+            status: hasMinted ? 'already_minted' : 'ready',
+            gasEstimate: gasEstimateEth,
+          });
+
+          await new Promise(r => setTimeout(r, 250));
+        } catch (err) {
+          addLog(`❌ Error scanning wallet ${i + 1}: ${err.message}`, 'error');
         }
-        
-        scannedContracts.push({
-          address: contractAddr,
-          wallets: contractScanned,
-          price: '0',
-        });
       }
-      
-      if (scannedContracts.length === 0) {
-        addLog('No contracts scanned successfully', 'error');
-        setIsScanning(false);
-        return;
+
+      setScannedWallets(scanned);
+      setWallets(scanned);
+      setEstimatedGas(scanned[0]?.gasEstimate || '0.002');
+      addLog(`✅ Scan complete! ${scanned.length} wallet(s) scanned`, 'success');
+
+      if (scanned.length > 0) {
+        setMintPhases(prev => ({ ...prev, public: true }));
       }
-      
-      setAllContracts(scannedContracts);
-      setSelectedContractIdx(0);
-      setWallets(scannedContracts[0].wallets);
-      setMintPrice(scannedContracts[0].price);
-      setEstimatedGas('0.002');
-      
-      addLog('Scan complete', 'success');
-      
     } catch (error) {
-      addLog(`Scan failed: ${error.message}`, 'error');
+      addLog(`❌ Scan failed: ${error.message}`, 'error');
     }
-    
     setIsScanning(false);
   };
-  
-  const switchContract = (idx) => {
-    setSelectedContractIdx(idx);
-    const contract = allContracts[idx];
-    setWallets(contract.wallets);
-    setMintPrice(contract.price);
-    addLog(`Switched to contract: ${contract.address.slice(0, 10)}...`, 'info');
-  };
-  
+
   const startMinting = async () => {
     if (!ethers) {
-      addLog('Ethers.js not loaded', 'error');
-      return;
+      addLog('❌ Ethers.js not loaded yet', 'error'); return;
     }
-    
     if (wallets.length === 0) {
-      addLog('Please scan wallets first', 'error');
-      return;
+      addLog('❌ Please scan wallets first', 'error'); return;
     }
-    
+
+    const selectedPhases = Object.keys(mintPhases).filter(k => mintPhases[k]);
+    if (selectedPhases.length === 0) {
+      addLog('❌ Please select at least one mint phase', 'error'); return;
+    }
+    if (config.useSeaDrop && !mintPhases.public) {
+      addLog('⚠️ SeaDrop mode sekarang hanya Public Mint. Allowlist/signed butuh proof/signature.', 'warning');
+    }
+
     setIsMinting(true);
     setMintStats({ success: 0, failed: 0, total: wallets.length });
-    addLog('Starting mint process', 'info');
-    
-    const currentContract = allContracts[selectedContractIdx];
-    const contractAddr = currentContract.address;
-    const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+    addLog('🚀 Starting mint process...', 'info');
+    addLog(`📋 Selected phases: ${selectedPhases.join(', ')}`, 'info');
+
+    const contractAddr = config.contractAddress || extractContractAddress(config.launchpadUrl);
+    const provider = makeProvider(config.rpcUrl);
     const updatedWallets = [...wallets];
-    
+
     let successCount = 0;
     let failedCount = 0;
-    
+
+    // Resolve SeaDrop feeRecipient if needed (once)
+    let seaDropFeeRecipient = config.feeRecipient;
+    if (config.useSeaDrop) {
+      seaDropFeeRecipient = await resolveSeaDropFeeRecipient(provider, config.seaDropAddress, contractAddr, config.feeRecipient);
+      addLog(`👛 SeaDrop feeRecipient: ${seaDropFeeRecipient}`, 'info');
+    }
+
     for (let i = 0; i < updatedWallets.length; i++) {
-      const walletInfo = updatedWallets[i];
-      
-      walletInfo.status = 'minting';
+      const w = updatedWallets[i];
+      w.status = 'minting';
       setWallets([...updatedWallets]);
-      
-      addLog(`Minting wallet ${i + 1}/${updatedWallets.length}`, 'info');
-      
-      const totalCost = parseFloat(mintPrice) + parseFloat(walletInfo.gasEstimate);
-      if (parseFloat(walletInfo.balance) < totalCost) {
-        walletInfo.status = 'failed';
-        walletInfo.error = 'Insufficient balance';
+
+      addLog(`🔄 Minting for wallet ${i + 1}/${updatedWallets.length}: ${w.address.slice(0, 6)}...${w.address.slice(-4)}`, 'info');
+
+      if (w.hasMinted) {
+        w.status = 'skipped'; w.error = 'Already minted';
         setWallets([...updatedWallets]);
-        addLog(`Failed: Insufficient balance`, 'error');
+        addLog(`⏭️ Skipped: Already minted`, 'warning');
         failedCount++;
         setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(r => setTimeout(r, 400));
         continue;
       }
-      
-      let mintSuccess = false;
-      let retryCount = 0;
-      
-      while (!mintSuccess && retryCount <= (autoRetry ? 3 : 0)) {
-        if (retryCount > 0) {
-          addLog(`Retry attempt ${retryCount}/3`, 'warning');
-        }
-        
-        try {
-          const wallet = new ethers.Wallet(walletInfo.privateKey, provider);
-          
-          const feeData = await provider.getFeeData();
-          let gasPrice = feeData.gasPrice;
-          
-          if (config.gasLevel === 'high') {
-            gasPrice = (gasPrice * 120n) / 100n;
-          } else if (config.gasLevel === 'low') {
-            gasPrice = (gasPrice * 80n) / 100n;
-          }
-          
-          const mintValue = ethers.parseEther(mintPrice);
-          
-          const mintVariations = [
-            { fn: 'mint', params: [] },
-            { fn: 'publicMint', params: [] },
-            { fn: 'mint', params: [1] },
-            { fn: 'publicMint', params: [1] },
-            { fn: 'claim', params: [] },
-          ];
-          
-          let tx = null;
-          let success = false;
-          
-          for (const variation of mintVariations) {
-            try {
-              addLog(`Trying ${variation.fn}...`, 'info');
-              
-              const contract = new ethers.Contract(contractAddr, [{type: 'function', name: variation.fn, stateMutability: 'payable'}], wallet);
-              
-              if (variation.params.length === 0) {
-                tx = await contract[variation.fn]({
-                  value: mintValue,
-                  gasPrice: gasPrice,
-                  gasLimit: 800000,
-                });
-              } else {
-                tx = await contract[variation.fn](...variation.params, {
-                  value: mintValue,
-                  gasPrice: gasPrice,
-                  gasLimit: 800000,
-                });
-              }
-              
-              success = true;
-              addLog(`Transaction sent: ${tx.hash}`, 'success');
-              break;
-            } catch (e) {
-              continue;
-            }
-          }
-          
-          if (!success || !tx) {
-            throw new Error('All mint methods failed');
-          }
-          
-          addLog(`Waiting for confirmation...`, 'info');
-          
-          try {
-            const receipt = await tx.wait();
-            
-            if (receipt && receipt.status === 1) {
-              mintSuccess = true;
-              walletInfo.txHash = receipt.hash;
-              addLog(`Success: ${receipt.hash}`, 'success');
-            } else {
-              throw new Error('Transaction reverted');
-            }
-          } catch (waitError) {
-            throw new Error(`Wait error: ${waitError.message}`);
-          }
-          
-        } catch (error) {
-          addLog(`Mint error: ${error.message}`, 'error');
-          retryCount++;
-          
-          if (retryCount > (autoRetry ? 3 : 0)) {
-            break;
-          }
-          
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-      
-      if (mintSuccess) {
-        walletInfo.status = 'success';
-        successCount++;
-        setMintStats(prev => ({ ...prev, success: prev.success + 1 }));
-      } else {
-        walletInfo.status = 'failed';
-        walletInfo.error = 'Transaction failed';
+
+      const totalCost = parseFloat(mintPrice || '0') + parseFloat(w.gasEstimate || '0');
+      if (parseFloat(w.balance || '0') < totalCost) {
+        w.status = 'failed'; w.error = 'Insufficient balance';
+        setWallets([...updatedWallets]);
+        addLog(`❌ Failed: Insufficient balance (need ${totalCost.toFixed(6)} ${chainSymbol}, have ${w.balance} ${chainSymbol})`, 'error');
         failedCount++;
         setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+        await new Promise(r => setTimeout(r, 400));
+        continue;
       }
-      
+
+      let mintSuccess = false;
+      let retryCount = 0;
+      let txHash = null;
+
+      while (!mintSuccess && retryCount <= (advancedOptions.autoRetry ? 3 : 0)) {
+        if (retryCount > 0) addLog(`🔄 Retry attempt ${retryCount}/3...`, 'warning');
+
+        try {
+          const wallet = new ethers.Wallet(w.privateKey, provider);
+
+          const feeDataGwei = await getGasPrice(provider);
+          let gasPrice = feeDataGwei;
+          if (config.gasLevel === 'high') gasPrice = (gasPrice * 120n) / 100n;
+          else if (config.gasLevel === 'low') gasPrice = (gasPrice * 80n) / 100n;
+
+          addLog(`⛽ Gas price: ${isV6 ? ethers.formatUnits(gasPrice, 'gwei') : ethers.utils.formatUnits(gasPrice.toString(), 'gwei')} Gwei`, 'info');
+
+          const q = BigInt(config.quantityPerWallet || 1);
+          const mintValue = toWei((Number(mintPrice || '0') * Number(q || 1n)).toString());
+
+          let tx;
+          if (config.useSeaDrop) {
+            // SeaDrop mint
+            const seaDrop = new ethers.Contract(config.seaDropAddress, seaDropAbi, wallet);
+            const args = [contractAddr, seaDropFeeRecipient, wallet.address, Number(q)];
+            const overrides = isV6
+              ? { value: mintValue, gasPrice, gasLimit: 300000n }
+              : { value: mintValue, gasPrice: ethers.BigNumber.from(gasPrice.toString()), gasLimit: 300000 };
+
+            addLog(`📤 Sending SeaDrop.mintPublic(${args.map((a,ix)=> ix===3?`${a}`:a).join(', ')})...`, 'info');
+            tx = await seaDrop.mintPublic(...args, overrides);
+          } else {
+            // Generic contract mint
+            const contract = new ethers.Contract(contractAddr, contractABI, wallet);
+            const overrides = isV6
+              ? { value: mintValue, gasPrice, gasLimit: 300000n }
+              : { value: mintValue, gasPrice: ethers.BigNumber.from(gasPrice.toString()), gasLimit: 300000 };
+
+            try {
+              if (mintFunctionHasQuantity) {
+                if (isV6) {
+                  const fn = contract.getFunction(`${mintFunctionName}(uint256)`);
+                  tx = await fn(Number(q), overrides);
+                } else {
+                  tx = await contract[mintFunctionName](Number(q), overrides);
+                }
+              } else {
+                if (isV6) {
+                  const fn = contract.getFunction(`${mintFunctionName}()`);
+                  tx = await fn(overrides);
+                } else {
+                  tx = await contract[mintFunctionName](overrides);
+                }
+              }
+            } catch (txError) {
+              addLog(`⚠️ Trying alternative mint method...`, 'warning');
+              const variations = [
+                { fn: 'mint', params: [] },
+                { fn: 'publicMint', params: [] },
+                { fn: 'mint', params: [Number(q)] },
+                { fn: 'publicMint', params: [Number(q)] },
+              ];
+              let ok = false;
+              for (const v of variations) {
+                try {
+                  addLog(`Trying ${v.fn}(${v.params.join(',')})...`, 'info');
+                  if (v.params.length === 0) tx = await contract[v.fn](overrides);
+                  else tx = await contract[v.fn](...v.params, overrides);
+                  ok = true; break;
+                } catch {}
+              }
+              if (!ok) throw new Error('All mint methods failed. Contract may not be active or wallet not eligible.');
+            }
+          }
+
+          addLog(`⏳ Waiting for confirmation... TX: ${tx.hash}`, 'info');
+          const receipt = await tx.wait();
+          const ok = isV6 ? (receipt.status === 1) : (receipt.status === 1);
+          if (!ok) throw new Error('Transaction failed');
+
+          mintSuccess = true;
+          txHash = tx.hash;
+          addLog(`✅ Success! TX: ${txHash}`, 'success');
+        } catch (error) {
+          addLog(`❌ Mint attempt failed: ${error.message}`, 'error');
+          retryCount++;
+          if (retryCount > (advancedOptions.autoRetry ? 3 : 0)) break;
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+
+      if (mintSuccess) {
+        w.status = 'success'; w.txHash = txHash; successCount++;
+        setMintStats(prev => ({ ...prev, success: prev.success + 1 }));
+      } else {
+        w.status = 'failed'; w.error = 'Transaction failed after retries'; failedCount++;
+        setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+      }
+
       setWallets([...updatedWallets]);
-      
+
       if (i < updatedWallets.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        addLog(`⏳ Waiting 3 seconds before next wallet...`, 'info');
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
-    
+
     setIsMinting(false);
-    addLog('Mint process completed', 'success');
+    addLog('🎉 Minting process completed!', 'success');
+    addLog(`📊 Results: ${successCount} success, ${failedCount} failed out of ${updatedWallets.length}`, 'info');
   };
-  
+
   const clearAll = () => {
-    setConfig({ launchpadUrl: '', rpcUrl: '', privateKeys: '', gasLevel: 'normal' });
-    setWallets([]);
-    setLogs([]);
+    setConfig({
+      launchpadUrl: '',
+      contractAddress: '',
+      rpcUrl: '',
+      privateKeys: '',
+      gasLevel: 'normal',
+      useSeaDrop: true,
+      seaDropAddress: '0x00005EA00Ac477B1030CE78506496e8C2dE24bf5',
+      feeRecipient: '',
+      quantityPerWallet: 1,
+    });
+    setWallets([]); setScannedWallets([]); setLogs([]);
     setMintStats({ success: 0, failed: 0, total: 0 });
-    setMintPrice('0');
-    setEstimatedGas('0');
-    setDetectedChain('');
-    setChainSymbol('ETH');
-    setAllContracts([]);
-    setSelectedContractIdx(0);
+    setMintPrice('0'); setEstimatedGas('0');
+    setDetectedChain(''); setChainSymbol('ETH'); setChainId(1);
+    setContractABI(null); setMintFunctionName(''); setMintFunctionHasQuantity(false);
+    setMintPhases({ public: true, whitelist: false, allowlist: false });
+    setAdvancedOptions({ autoRetry: true, sniperMode: false, flashbots: false });
   };
-  
+
   const getStatusIcon = (status) => {
     switch (status) {
+      case 'waiting':
       case 'ready': return <Clock className="w-4 h-4 text-gray-400" />;
       case 'minting': return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
       case 'success': return <CheckCircle className="w-4 h-4 text-green-500" />;
       case 'failed': return <XCircle className="w-4 h-4 text-red-500" />;
+      case 'skipped':
+      case 'already_minted': return <AlertCircle className="w-4 h-4 text-yellow-500" />;
       default: return <Clock className="w-4 h-4 text-gray-400" />;
     }
+  };
+
+  const getStatusText = (wallet) => {
+    switch (wallet.status) {
+      case 'waiting':
+      case 'ready': return 'Ready';
+      case 'minting': return 'Minting...';
+      case 'success': return wallet.txHash ? `Success: ${wallet.txHash.slice(0, 10)}...` : 'Success';
+      case 'failed': return wallet.error || 'Failed';
+      case 'skipped': return wallet.error || 'Skipped';
+      case 'already_minted': return 'Already Minted';
+      default: return 'Unknown';
+    }
+  };
+
+  const getExplorerUrl = (cid, txHash) => {
+    const explorers = {
+      1: 'https://etherscan.io',
+      5: 'https://goerli.etherscan.io',
+      11155111: 'https://sepolia.etherscan.io',
+      137: 'https://polygonscan.com',
+      80001: 'https://mumbai.polygonscan.com',
+      42161: 'https://arbiscan.io',
+      10: 'https://optimistic.etherscan.io',
+      8453: 'https://basescan.org',
+      56: 'https://bscscan.com',
+    };
+    return `${explorers[cid] || 'https://etherscan.io'}/tx/${txHash}`;
   };
 
   return (
@@ -365,17 +652,17 @@ const OpenSeaAutoMint = () => {
           <div className="flex items-center gap-3">
             <Zap className="w-8 h-8 text-yellow-300" />
             <div>
-              <h1 className="text-3xl font-bold text-white">OpenSea Auto Mint Bot</h1>
-              <p className="text-purple-100 text-sm">Mint NFT to multiple contracts</p>
+              <h1 className="text-3xl font-bold text-white">OpenSea Launchpad Mint Bot (SeaDrop)</h1>
+              <p className="text-purple-100 text-sm">Multi-wallet minting via SeaDrop or direct contract</p>
             </div>
           </div>
         </div>
-        
+
         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-4 mt-4">
           <div className="flex items-start gap-2">
             <AlertCircle className="w-5 h-5 text-yellow-500 flex-shrink-0 mt-0.5" />
             <div className="text-sm text-yellow-200">
-              <strong>Warning:</strong> This is a real minting tool. Transactions are irreversible!
+              <strong>Security:</strong> Private keys hanya disimpan di memori, tidak di-save. Verifikasi alamat kontrak & mulai dengan jumlah kecil. Transaksi bersifat irreversibel.
             </div>
           </div>
         </div>
@@ -383,132 +670,258 @@ const OpenSeaAutoMint = () => {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-6">
             <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-              <h2 className="text-xl font-semibold text-white mb-4">Configuration</h2>
-              
+              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                <span className="text-2xl">📝</span> Configuration
+              </h2>
+
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">OpenSea Link / Contract</label>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    OpenSea Link / NFT Contract Address
+                  </label>
                   <input
                     type="text"
                     value={config.launchpadUrl}
-                    onChange={(e) => setConfig({ ...config, launchpadUrl: e.target.value })}
+                    onChange={(e) => setConfig({ ...config, launchpadUrl: e.target.value, contractAddress: extractContractAddress(e.target.value) })}
                     placeholder="https://opensea.io/... or 0x..."
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white"
+                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
                   />
-                  {extractContractAddresses(config.launchpadUrl).length > 0 && (
-                    <p className="text-xs text-green-400 mt-1">Found {extractContractAddresses(config.launchpadUrl).length} contracts</p>
+                  {config.contractAddress && (
+                    <p className="text-xs text-green-400 mt-1">
+                      Detected contract: {config.contractAddress}
+                    </p>
                   )}
                 </div>
 
-                {allContracts.length > 1 && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Select Contract</label>
-                    <select
-                      value={selectedContractIdx}
-                      onChange={(e) => switchContract(Number(e.target.value))}
-                      disabled={isMinting}
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white"
-                    >
-                      {allContracts.map((c, idx) => (
-                        <option key={idx} value={idx}>
-                          Contract {idx + 1}: {c.address.slice(0, 10)}...
-                        </option>
-                      ))}
-                    </select>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      RPC URL {detectedChain && <span className="text-purple-400">({detectedChain})</span>}
+                    </label>
+                    <input
+                      type="text"
+                      value={config.rpcUrl}
+                      onChange={(e) => setConfig({ ...config, rpcUrl: e.target.value })}
+                      placeholder="https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
+                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    />
+                    <p className="text-xs text-gray-400 mt-1">
+                      Get free RPC from: Alchemy, Infura, QuickNode, or public RPCs
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Private Keys (max 10, one per line, must start with 0x)
+                    </label>
+                    <textarea
+                      value={config.privateKeys}
+                      onChange={(e) => setConfig({ ...config, privateKeys: e.target.value })}
+                      placeholder="0xabc123...&#10;0xdef456...&#10;0xghi789..."
+                      rows={4}
+                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm"
+                    />
+                    <p className="text-xs text-gray-400 mt-1">
+                      {parsePrivateKeys(config.privateKeys).length}/10 valid wallets
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      checked={config.useSeaDrop}
+                      onChange={(e) => setConfig({ ...config, useSeaDrop: e.target.checked })}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                    />
+                    <label className="text-white text-sm">Use OpenSea Launchpad (SeaDrop)</label>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Quantity per wallet</label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={config.quantityPerWallet}
+                      onChange={(e) => setConfig({ ...config, quantityPerWallet: Math.max(1, Number(e.target.value||1)) })}
+                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    />
+                  </div>
+                </div>
+
+                {config.useSeaDrop && (
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">SeaDrop Address</label>
+                      <input
+                        type="text"
+                        value={config.seaDropAddress}
+                        onChange={(e) => setConfig({ ...config, seaDropAddress: e.target.value })}
+                        placeholder="0x00005EA0..."
+                        className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      />
+                      <p className="text-xs text-gray-400 mt-1">Default: canonical SeaDrop</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">Fee Recipient (optional)</label>
+                      <input
+                        type="text"
+                        value={config.feeRecipient}
+                        onChange={(e) => setConfig({ ...config, feeRecipient: e.target.value })}
+                        placeholder="auto-detect if empty"
+                        className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">Gas Level</label>
+                      <select
+                        value={config.gasLevel}
+                        onChange={(e) => setConfig({ ...config, gasLevel: e.target.value })}
+                        className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="low">Low (Slower, -20%)</option>
+                        <option value="normal">Normal (Recommended)</option>
+                        <option value="high">High (Faster, +20%)</option>
+                      </select>
+                    </div>
                   </div>
                 )}
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">RPC URL {detectedChain && <span className="text-purple-400">({detectedChain})</span>}</label>
-                  <input
-                    type="text"
-                    value={config.rpcUrl}
-                    onChange={(e) => setConfig({ ...config, rpcUrl: e.target.value })}
-                    placeholder="https://eth-mainnet.g.alchemy.com/v2/..."
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white"
-                  />
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Private Keys (max 10)</label>
-                  <textarea
-                    value={config.privateKeys}
-                    onChange={(e) => setConfig({ ...config, privateKeys: e.target.value })}
-                    placeholder="0xabc123...&#10;0xdef456..."
-                    rows={4}
-                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white font-mono text-sm"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">{parsePrivateKeys(config.privateKeys).length}/10 valid</p>
-                </div>
-                
-                <div className="flex gap-4">
-                  <div className="flex-1">
-                    <label className="block text-sm font-medium text-gray-300 mb-2">Gas Level</label>
-                    <select
-                      value={config.gasLevel}
-                      onChange={(e) => setConfig({ ...config, gasLevel: e.target.value })}
-                      className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white"
-                    >
-                      <option value="low">Low (-20%)</option>
-                      <option value="normal">Normal</option>
-                      <option value="high">High (+20%)</option>
-                    </select>
-                  </div>
-                  
+
+                {!config.useSeaDrop && (
                   <div className="flex items-end">
                     <button
                       onClick={scanWallets}
                       disabled={isScanning || isMinting}
-                      className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-700 text-white px-6 py-2.5 rounded-lg font-medium flex items-center gap-2"
+                      className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-700 text-white px-6 py-2.5 rounded-lg font-medium flex items-center gap-2 transition-all disabled:cursor-not-allowed"
                     >
-                      {isScanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Scan className="w-4 h-4" />}
-                      {isScanning ? 'Scanning...' : 'Scan'}
+                      {isScanning ? (<><Loader2 className="w-4 h-4 animate-spin" />Scanning...</>) : (<><Scan className="w-4 h-4" />Scan Eligible</>)}
                     </button>
                   </div>
-                </div>
+                )}
+              </div>
 
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={autoRetry}
-                    onChange={(e) => setAutoRetry(e.target.checked)}
-                    className="w-4 h-4"
-                  />
-                  <span className="text-white text-sm">Auto-retry (3x)</span>
+              {/* If SeaDrop, still allow scanning button */}
+              <div className="mt-4">
+                <button
+                  onClick={scanWallets}
+                  disabled={isScanning || isMinting}
+                  className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-700 text-white px-6 py-2.5 rounded-lg font-medium flex items-center gap-2 transition-all disabled:cursor-not-allowed"
+                >
+                  {isScanning ? (<><Loader2 className="w-4 h-4 animate-spin" />Scanning...</>) : (<><Scan className="w-4 h-4" />Scan Eligible</>)}
+                </button>
+              </div>
+
+              {scannedWallets.length > 0 && (
+                <div className="mt-6 pt-6 border-t border-slate-700">
+                  <label className="block text-sm font-medium text-gray-300 mb-3">
+                    Mint Phase Selection
+                  </label>
+                  <div className="flex flex-wrap gap-4">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mintPhases.public}
+                        onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Public Mint</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mintPhases.whitelist}
+                        onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Whitelist (SeaDrop require proof)</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mintPhases.allowlist}
+                        onChange={(e) => setMintPhases({ ...mintPhases, allowlist: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Allowlist (SeaDrop require proof)</span>
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-4 pt-4 border-t border-slate-700">
+                <label className="block text-sm font-medium text-gray-300 mb-3">
+                  Advanced Options (Optional)
                 </label>
-                
-                <div className="flex gap-3">
-                  <button
-                    onClick={startMinting}
-                    disabled={isMinting || wallets.length === 0}
-                    className="flex-1 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 disabled:from-gray-600 disabled:to-gray-700 text-white py-3 rounded-lg font-semibold flex items-center justify-center gap-2"
-                  >
-                    {isMinting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5" />}
-                    {isMinting ? 'Minting...' : 'Start Mint'}
-                  </button>
-                  
-                  <button
-                    onClick={clearAll}
-                    disabled={isMinting || isScanning}
-                    className="px-6 bg-slate-700 hover:bg-slate-600 text-white py-3 rounded-lg font-semibold"
-                  >
-                    Clear
-                  </button>
+                <div className="flex flex-wrap gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={advancedOptions.autoRetry}
+                      onChange={(e) => setAdvancedOptions({ ...advancedOptions, autoRetry: e.target.checked })}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                    />
+                    <span className="text-white text-sm">Auto-retry (3x)</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={advancedOptions.sniperMode}
+                      onChange={(e) => setAdvancedOptions({ ...advancedOptions, sniperMode: e.target.checked })}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                    />
+                    <span className="text-white text-sm">Sniper Mode</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={advancedOptions.flashbots}
+                      onChange={(e) => setAdvancedOptions({ ...advancedOptions, flashbots: e.target.checked })}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                    />
+                    <span className="text-white text-sm">Flashbots</span>
+                  </label>
                 </div>
               </div>
+
+              <div className="mt-6 flex gap-3">
+                <button
+                  onClick={startMinting}
+                  disabled={isMinting || wallets.length === 0}
+                  className="flex-1 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 disabled:from-gray-600 disabled:to-gray-700 text-white py-3 rounded-lg font-semibold flex items-center justify-center gap-2 transition-all disabled:cursor-not-allowed"
+                >
+                  {isMinting ? (<><Loader2 className="w-5 h-5 animate-spin" />Minting...</>) : (<><Zap className="w-5 h-5" />Start Mint</>)}
+                </button>
+
+                <button
+                  onClick={clearAll}
+                  disabled={isMinting || isScanning}
+                  className="px-6 bg-slate-700 hover:bg-slate-600 disabled:bg-gray-700 text-white py-3 rounded-lg font-semibold transition-all disabled:cursor-not-allowed"
+                >
+                  Clear
+                </button>
+              </div>
             </div>
-            
+
             {wallets.length > 0 && (
               <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                <h2 className="text-xl font-semibold text-white mb-4">Wallet Status ({wallets.length})</h2>
-                
-                <div className="space-y-2 max-h-96 overflow-y-auto">
+                <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                  <span className="text-2xl">📊</span> Wallet Status ({wallets.length} wallets)
+                </h2>
+
+                <div className="space-y-2">
                   {wallets.map((wallet, idx) => (
-                    <div key={idx} className="bg-slate-700/30 rounded-lg p-3 flex items-center justify-between">
+                    <div key={idx} className="bg-slate-700/30 rounded-lg p-4 flex items-center justify-between">
                       <div className="flex items-center gap-3 flex-1">
                         {getStatusIcon(wallet.status)}
                         <div className="flex-1">
-                          <p className="text-white font-mono text-sm">{wallet.address.slice(0, 6)}...{wallet.address.slice(-4)}</p>
+                          <p className="text-white font-mono text-sm">
+                            {wallet.address.slice(0, 6)}...{wallet.address.slice(-4)}
+                          </p>
                           <p className="text-gray-400 text-xs">Balance: {wallet.balance} {chainSymbol}</p>
                         </div>
                       </div>
@@ -517,15 +930,26 @@ const OpenSeaAutoMint = () => {
                           wallet.status === 'success' ? 'text-green-400' :
                           wallet.status === 'failed' ? 'text-red-400' :
                           wallet.status === 'minting' ? 'text-blue-400' :
+                          wallet.status === 'skipped' ? 'text-yellow-400' :
                           'text-gray-400'
                         }`}>
-                          {wallet.status === 'ready' ? 'Ready' : wallet.status === 'minting' ? 'Minting...' : wallet.status}
+                          {getStatusText(wallet)}
                         </p>
+                        {wallet.txHash && (
+                          <a
+                            href={getExplorerUrl(chainId, wallet.txHash)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-purple-400 hover:text-purple-300"
+                          >
+                            View TX →
+                          </a>
+                        )}
                       </div>
                     </div>
                   ))}
                 </div>
-                
+
                 {mintStats.total > 0 && (
                   <div className="mt-4 pt-4 border-t border-slate-700 grid grid-cols-3 gap-4">
                     <div className="text-center">
@@ -545,12 +969,14 @@ const OpenSeaAutoMint = () => {
               </div>
             )}
           </div>
-          
+
           <div className="space-y-6">
-            {wallets.length > 0 && (
+            {scannedWallets.length > 0 && (
               <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-                <h2 className="text-xl font-semibold text-white mb-4">Mint Info</h2>
-                
+                <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                  <span className="text-2xl">💰</span> Mint Info
+                </h2>
+
                 <div className="space-y-3">
                   <div className="flex justify-between">
                     <span className="text-gray-400">Mint Price:</span>
@@ -561,9 +987,9 @@ const OpenSeaAutoMint = () => {
                     <span className="text-white font-semibold">{estimatedGas} {chainSymbol}</span>
                   </div>
                   <div className="flex justify-between pt-2 border-t border-slate-700">
-                    <span className="text-gray-400">Total Cost:</span>
+                    <span className="text-gray-400">Total (est) / wallet:</span>
                     <span className="text-purple-400 font-bold">
-                      {(parseFloat(mintPrice) + parseFloat(estimatedGas)).toFixed(4)} {chainSymbol}
+                      {(parseFloat(mintPrice || '0') + parseFloat(estimatedGas || '0')).toFixed(6)} {chainSymbol}
                     </span>
                   </div>
                   {detectedChain && (
@@ -572,16 +998,26 @@ const OpenSeaAutoMint = () => {
                       <span className="text-white font-semibold">{detectedChain}</span>
                     </div>
                   )}
+                  {mintFunctionName && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Mint Function:</span>
+                      <span className="text-white font-mono text-sm">
+                        {config.useSeaDrop ? `SeaDrop.${mintFunctionName}(address,address,address,uint256)` : `${mintFunctionName}(${mintFunctionHasQuantity ? 'uint256' : ''})`}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
-            
+
             <div className="bg-slate-800/50 backdrop-blur rounded-2xl p-6 shadow-xl border border-slate-700">
-              <h2 className="text-xl font-semibold text-white mb-4">Live Logs</h2>
-              
+              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                <span className="text-2xl">📜</span> Live Logs
+              </h2>
+
               <div className="bg-slate-900/50 rounded-lg p-4 h-96 overflow-y-auto font-mono text-xs">
                 {logs.length === 0 ? (
-                  <p className="text-gray-500 text-center py-8">No logs yet. Start by scanning.</p>
+                  <p className="text-gray-500 text-center py-8">No logs yet. Start by scanning wallets.</p>
                 ) : (
                   <div className="space-y-1">
                     {logs.map((log, idx) => (
@@ -604,9 +1040,11 @@ const OpenSeaAutoMint = () => {
             </div>
           </div>
         </div>
-        
+
         <div className="mt-6 text-center text-gray-400 text-sm pb-4">
-          <p>This is a real minting tool. Always verify contract addresses!</p>
+          <p>⚠️ This is a real minting tool. Transactions are irreversible. Use at your own risk.</p>
+          <p className="mt-1">SeaDrop allowlist/signed mints require proofs/signatures from the project.</p>
+          <p className="mt-2">Made with 💜 for the NFT community</p>
         </div>
       </div>
     </div>
