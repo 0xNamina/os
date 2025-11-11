@@ -694,4 +694,3 @@ const OpenSeaAutoMint = () => {
                         <p key={idx} className="ml-2 font-mono">{idx + 1}. {addr}</p>
                       ))}
                     </div>
-                  )}
