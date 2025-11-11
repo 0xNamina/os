@@ -87,7 +87,6 @@ const OpenSeaAutoMint = () => {
     42161: 'arbitrum',
     10: 'optimism',
     8453: 'base',
-    # ApeChain not supported by OpenSea (skip)
   }[chainId] || 'ethereum');
 
   const SEAPORT_ADDRESSES = {
