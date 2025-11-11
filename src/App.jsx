@@ -7,7 +7,6 @@ let tx;
             { fn: 'publicMint', params: [] },
             { fn: 'mint', params: [1] },
             { fn: 'publicMint', params: [1] },
-            { fn: 'mint', params: [1, '0x'] },
             { fn: 'whitelistMint', params: [] },
             { fn: 'allowlistMint', params: [] },
             { fn: 'claim', params: [] },
@@ -22,36 +21,22 @@ let tx;
                 continue;
               }
               
-              let txData;
               const txOptions = {
                 value: mintValue,
                 gasPrice: gasPrice,
                 gasLimit: 800000,
               };
               
+              let txData;
               if (variation.params.length === 0) {
-                txData = contract[variation.fn](txOptions);
+                txData = await contract[variation.fn](txOptions);
               } else if (variation.params.length === 1) {
-                txData = contract[variation.fn](variation.params[0], txOptions);
+                txData = await contract[variation.fn](variation.params[0], txOptions);
               } else {
-                txData = contract[variation.fn](...variation.params, txOptions);
+                txData = await contract[variation.fn](...variation.params, txOptions);
               }
               
-              // Estimate gas first to check if it would work
-              try {
-                if (variation.params.length === 0) {
-                  await contract[variation.fn].estimateGas(txOptions);
-                } else if (variation.params.length === 1) {
-                  await contract[variation.fn].estimateGas(variation.params[0], txOptions);
-                } else {
-                  await contract[variation.fn].estimateGas(...variation.params, txOptions);
-                }
-              } catch (estimateError) {
-                lastError = estimateError.message;
-                continue;
-              }
-              
-              tx = await txData;
+              tx = txData;
               success = true;
               addLog(`  ✅ Transaksi dikirim dengan ${variation.fn}`, 'success');
               break;
