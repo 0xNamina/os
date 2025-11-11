@@ -108,26 +108,101 @@ const OpenSeaAutoMint = () => {
     // NOTE: APE / others not supported -> fallback to human-readable ABI guesses
   };
 
-  const getContractABI = async (contractAddress, currentChainId) => {
-    const apiUrl = apiUrls[currentChainId];
+  const getContractABI = async (contractAddress, chainId) => {
+    const apiKeys = {
+      1: 'YourEtherscanAPIKey',
+      137: 'YourPolygonscanAPIKey',
+    };
+    
+    const apiUrls = {
+      1: 'https://api.etherscan.io/api',
+      5: 'https://api-goerli.etherscan.io/api',
+      11155111: 'https://api-sepolia.etherscan.io/api',
+      137: 'https://api.polygonscan.com/api',
+      80001: 'https://api-testnet.polygonscan.com/api',
+      42161: 'https://api.arbiscan.io/api',
+      10: 'https://api-optimistic.etherscan.io/api',
+      8453: 'https://api.basescan.org/api',
+      56: 'https://api.bscscan.com/api',
+      33139: 'https://apescan.io/api',
+    };
+    
+    const apiUrl = apiUrls[chainId];
     if (!apiUrl) {
-      // Fallback: minimal human-readable ABI candidates
       return [
-        'function mint() payable',
-        'function publicMint() payable',
-        'function whitelistMint() payable',
-        'function allowlistMint() payable',
-        'function claim() payable',
-        'function mint(uint256 quantity) payable',
-        'function publicMint(uint256 quantity) payable',
-        'function whitelistMint(uint256 quantity) payable',
-        'function allowlistMint(uint256 quantity) payable',
-        'function getMintPrice() view returns (uint256)',
-        'function mintPrice() view returns (uint256)',
-        'function cost() view returns (uint256)',
-        'function price() view returns (uint256)',
-        'function balanceOf(address owner) view returns (uint256)'
+        "function mint() public payable",
+        "function mint(uint256) public payable",
+        "function mint(uint256,uint256) public payable",
+        "function publicMint() public payable",
+        "function publicMint(uint256) public payable",
+        "function safeMint(address) public payable",
+        "function safeMint(address,uint256) public payable",
+        "function claim() public payable",
+        "function claim(uint256) public payable",
+        "function purchase(uint256) public payable",
+        "function buy(uint256) public payable",
+        "function mintNFT() public payable",
+        "function mintNFT(uint256) public payable",
+        "function whitelistMint() public payable",
+        "function whitelistMint(uint256) public payable",
+        "function allowlistMint() public payable",
+        "function allowlistMint(uint256) public payable",
+        "function mintPrice() public view returns (uint256)",
+        "function cost() public view returns (uint256)",
+        "function price() public view returns (uint256)",
+        "function getPrice() public view returns (uint256)",
+        "function totalSupply() public view returns (uint256)",
+        "function maxSupply() public view returns (uint256)",
+        "function balanceOf(address) public view returns (uint256)",
+        "function paused() public view returns (bool)",
+        "function publicSaleActive() public view returns (bool)",
+        "function saleIsActive() public view returns (bool)"
       ];
+    }
+    
+    try {
+      const response = await fetch(
+        `${apiUrl}?module=contract&action=getabi&address=${contractAddress}&apikey=${apiKeys[chainId] || ''}`
+      );
+      const data = await response.json();
+      
+      if (data.status === '1' && data.result) {
+        addLog(`✅ Successfully fetched verified contract ABI`, 'success');
+        return JSON.parse(data.result);
+      }
+    } catch (error) {
+      addLog(`⚠️ Could not fetch ABI from explorer, using comprehensive generic ABI`, 'warning');
+    }
+    
+    return [
+      "function mint() public payable",
+      "function mint(uint256) public payable",
+      "function mint(uint256,uint256) public payable",
+      "function publicMint() public payable",
+      "function publicMint(uint256) public payable",
+      "function safeMint(address) public payable",
+      "function safeMint(address,uint256) public payable",
+      "function claim() public payable",
+      "function claim(uint256) public payable",
+      "function purchase(uint256) public payable",
+      "function buy(uint256) public payable",
+      "function mintNFT() public payable",
+      "function mintNFT(uint256) public payable",
+      "function whitelistMint() public payable",
+      "function whitelistMint(uint256) public payable",
+      "function allowlistMint() public payable",
+      "function allowlistMint(uint256) public payable",
+      "function mintPrice() public view returns (uint256)",
+      "function cost() public view returns (uint256)",
+      "function price() public view returns (uint256)",
+      "function getPrice() public view returns (uint256)",
+      "function totalSupply() public view returns (uint256)",
+      "function maxSupply() public view returns (uint256)",
+      "function balanceOf(address) public view returns (uint256)",
+      "function paused() public view returns (bool)",
+      "function publicSaleActive() public view returns (bool)",
+      "function saleIsActive() public view returns (bool)"
+    ];
     }
     try {
       const res = await fetch(`${apiUrl}?module=contract&action=getabi&address=${contractAddress}&apikey=${apiKeys[currentChainId] || ''}`);
