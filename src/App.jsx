@@ -39,8 +39,10 @@ const OpenSeaAutoMint = () => {
   const [mintPrice, setMintPrice] = useState('0');
   const [estimatedGas, setEstimatedGas] = useState('0');
   const [detectedChain, setDetectedChain] = useState('');
+  const [chainSymbol, setChainSymbol] = useState('ETH');
   const [contractABI, setContractABI] = useState(null);
   const [mintFunctionName, setMintFunctionName] = useState('');
+  const [mintFunctionHasQuantity, setMintFunctionHasQuantity] = useState(false);
   
   const logsEndRef = useRef(null);
   
@@ -76,31 +78,31 @@ const OpenSeaAutoMint = () => {
       const chainId = Number(network.chainId);
       
       const chains = {
-        1: 'Ethereum Mainnet',
-        5: 'Goerli Testnet',
-        11155111: 'Sepolia Testnet',
-        137: 'Polygon',
-        80001: 'Mumbai Testnet',
-        42161: 'Arbitrum One',
-        10: 'Optimism',
-        8453: 'Base',
-        43114: 'Avalanche',
-        56: 'BSC',
+        1: { name: 'Ethereum Mainnet', symbol: 'ETH' },
+        5: { name: 'Goerli Testnet', symbol: 'ETH' },
+        11155111: { name: 'Sepolia Testnet', symbol: 'ETH' },
+        137: { name: 'Polygon', symbol: 'MATIC' },
+        80001: { name: 'Mumbai Testnet', symbol: 'MATIC' },
+        42161: { name: 'Arbitrum One', symbol: 'ETH' },
+        10: { name: 'Optimism', symbol: 'ETH' },
+        8453: { name: 'Base', symbol: 'ETH' },
+        43114: { name: 'Avalanche', symbol: 'AVAX' },
+        56: { name: 'BSC', symbol: 'BNB' },
+        33139: { name: 'APE Chain', symbol: 'APE' },
       };
       
-      return { name: chains[chainId] || `Chain ID: ${chainId}`, chainId };
+      const chainInfo = chains[chainId] || { name: `Chain ID: ${chainId}`, symbol: 'ETH' };
+      return { name: chainInfo.name, symbol: chainInfo.symbol, chainId };
     } catch (error) {
       addLog(`❌ Failed to detect chain: ${error.message}`, 'error');
-      return { name: 'Unknown Chain', chainId: 0 };
+      return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0 };
     }
   };
   
   const getContractABI = async (contractAddress, chainId) => {
-    // Try to get ABI from Etherscan-like APIs
     const apiKeys = {
-      1: 'YourEtherscanAPIKey', // Ethereum
-      137: 'YourPolygonscanAPIKey', // Polygon
-      // Add more as needed
+      1: 'YourEtherscanAPIKey',
+      137: 'YourPolygonscanAPIKey',
     };
     
     const apiUrls = {
@@ -117,7 +119,6 @@ const OpenSeaAutoMint = () => {
     
     const apiUrl = apiUrls[chainId];
     if (!apiUrl) {
-      // Return generic ERC721 mint ABI
       return [
         "function mint() public payable",
         "function publicMint() public payable",
@@ -143,7 +144,6 @@ const OpenSeaAutoMint = () => {
       addLog(`⚠️ Could not fetch ABI, using generic ERC721 ABI`, 'warning');
     }
     
-    // Fallback to generic mint ABI
     return [
       "function mint() public payable",
       "function publicMint() public payable",
@@ -164,22 +164,39 @@ const OpenSeaAutoMint = () => {
       (item.name?.toLowerCase().includes('mint') || item.name === 'claim')
     );
     
-    // Priority: publicMint > mint > whitelistMint > allowlistMint
-    const priorities = ['publicMint', 'mint', 'whitelistMint', 'allowlistMint', 'claim'];
+    const priorities = [
+      { name: 'publicMint', params: 0 },
+      { name: 'mint', params: 0 },
+      { name: 'whitelistMint', params: 0 },
+      { name: 'allowlistMint', params: 0 },
+      { name: 'claim', params: 0 },
+    ];
     
     for (const priority of priorities) {
-      const found = mintFunctions.find(f => f.name === priority);
-      if (found) return found.name;
+      const found = mintFunctions.find(f => 
+        f.name === priority.name && 
+        (!f.inputs || f.inputs.length === priority.params)
+      );
+      if (found) return { name: found.name, hasQuantity: false };
     }
     
-    return mintFunctions[0]?.name || 'mint';
+    const withQuantity = mintFunctions.find(f => 
+      f.inputs && 
+      f.inputs.length === 1 && 
+      f.inputs[0].type === 'uint256'
+    );
+    
+    if (withQuantity) {
+      return { name: withQuantity.name, hasQuantity: true };
+    }
+    
+    return { name: mintFunctions[0]?.name || 'mint', hasQuantity: false };
   };
   
   const getMintPrice = async (provider, contractAddress, abi) => {
     try {
       const contract = new ethers.Contract(contractAddress, abi, provider);
       
-      // Try different price getter functions
       const priceGetters = ['mintPrice', 'cost', 'price', 'getMintPrice'];
       
       for (const getter of priceGetters) {
@@ -228,30 +245,27 @@ const OpenSeaAutoMint = () => {
     addLog(`📝 Found ${keys.length} wallet(s) to scan`, 'info');
     
     try {
-      // Connect to RPC
       const provider = new ethers.JsonRpcProvider(config.rpcUrl);
       addLog('🔗 Connected to RPC...', 'info');
       
-      // Detect chain
       const chainInfo = await detectChainFromRPC(config.rpcUrl);
       setDetectedChain(chainInfo.name);
-      addLog(`🔗 Chain: ${chainInfo.name}`, 'info');
+      setChainSymbol(chainInfo.symbol);
+      addLog(`🔗 Chain: ${chainInfo.name} (${chainInfo.symbol})`, 'info');
       
-      // Get contract ABI
       addLog('📄 Fetching contract ABI...', 'info');
       const abi = await getContractABI(contractAddr, chainInfo.chainId);
       setContractABI(abi);
       
-      // Detect mint function
       const mintFunc = detectMintFunction(abi);
-      setMintFunctionName(mintFunc);
-      addLog(`🎯 Detected mint function: ${mintFunc}()`, 'info');
+      setMintFunctionName(mintFunc.name);
+      setMintFunctionHasQuantity(mintFunc.hasQuantity);
+      addLog(`🎯 Detected mint function: ${mintFunc.name}(${mintFunc.hasQuantity ? 'uint256 quantity' : ''})`, 'info');
       
-      // Get mint price
       addLog('💰 Fetching mint price...', 'info');
       const price = await getMintPrice(provider, contractAddr, abi);
       setMintPrice(price);
-      addLog(`💰 Mint Price: ${price} ETH`, 'info');
+      addLog(`💰 Mint Price: ${price} ${chainInfo.symbol}`, 'info');
       
       const contract = new ethers.Contract(contractAddr, abi, provider);
       const scanned = [];
@@ -265,32 +279,33 @@ const OpenSeaAutoMint = () => {
           
           addLog(`Scanning wallet ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
           
-          // Get balance
           const balanceWei = await provider.getBalance(address);
           const balance = ethers.formatEther(balanceWei);
           
-          // Check if already minted (try to get NFT balance)
           let hasMinted = false;
           try {
             const nftBalance = await contract.balanceOf(address);
             hasMinted = Number(nftBalance) > 0;
           } catch (e) {
-            // If balanceOf fails, assume not minted
             hasMinted = false;
           }
           
-          // Estimate gas
           let gasEstimate = '0.002';
           try {
-            const gasLimit = await contract[mintFunc].estimateGas({ 
+            const estimateParams = { 
               value: ethers.parseEther(price),
               from: address 
-            });
+            };
+            
+            const gasLimit = mintFunc.hasQuantity 
+              ? await contract[mintFunc.name].estimateGas(1, estimateParams)
+              : await contract[mintFunc.name].estimateGas(estimateParams);
+              
             const feeData = await provider.getFeeData();
             const gasCost = gasLimit * feeData.gasPrice;
             gasEstimate = ethers.formatEther(gasCost);
           } catch (e) {
-            // Use default if estimation fails
+            // Use default
           }
           
           scanned.push({
@@ -299,8 +314,8 @@ const OpenSeaAutoMint = () => {
             balance,
             hasMinted,
             eligiblePhases: {
-              public: true, // Assume public is available
-              whitelist: false, // Would need merkle proof verification
+              public: true,
+              whitelist: false,
               allowlist: false,
             },
             status: hasMinted ? 'already_minted' : 'ready',
@@ -320,7 +335,6 @@ const OpenSeaAutoMint = () => {
       setEstimatedGas(scanned[0]?.gasEstimate || '0.002');
       addLog(`✅ Scan complete! ${scanned.length} wallet(s) scanned`, 'success');
       
-      // Auto-select public mint if available
       if (scanned.length > 0) {
         setMintPhases({ ...mintPhases, public: true });
       }
@@ -369,7 +383,6 @@ const OpenSeaAutoMint = () => {
       
       addLog(`🔄 Minting for wallet ${i + 1}/${updatedWallets.length}: ${walletInfo.address.slice(0, 6)}...${walletInfo.address.slice(-4)}`, 'info');
       
-      // Check if already minted
       if (walletInfo.hasMinted) {
         walletInfo.status = 'skipped';
         walletInfo.error = 'Already minted';
@@ -381,20 +394,18 @@ const OpenSeaAutoMint = () => {
         continue;
       }
       
-      // Check balance
       const totalCost = parseFloat(mintPrice) + parseFloat(walletInfo.gasEstimate);
       if (parseFloat(walletInfo.balance) < totalCost) {
         walletInfo.status = 'failed';
         walletInfo.error = 'Insufficient balance';
         setWallets([...updatedWallets]);
-        addLog(`❌ Failed: Insufficient balance (need ${totalCost.toFixed(4)} ETH, have ${walletInfo.balance} ETH)`, 'error');
+        addLog(`❌ Failed: Insufficient balance (need ${totalCost.toFixed(4)} ${chainSymbol}, have ${walletInfo.balance} ${chainSymbol})`, 'error');
         failedCount++;
         setMintStats(prev => ({ ...prev, failed: prev.failed + 1 }));
         await new Promise(resolve => setTimeout(resolve, 1000));
         continue;
       }
       
-      // Try minting
       let mintSuccess = false;
       let retryCount = 0;
       let txHash = null;
@@ -408,26 +419,30 @@ const OpenSeaAutoMint = () => {
           const wallet = new ethers.Wallet(walletInfo.privateKey, provider);
           const contract = new ethers.Contract(contractAddr, contractABI, wallet);
           
-          // Get gas settings
           const feeData = await provider.getFeeData();
           let gasPrice = feeData.gasPrice;
           
           if (config.gasLevel === 'high') {
-            gasPrice = (gasPrice * 120n) / 100n; // 20% more
+            gasPrice = (gasPrice * 120n) / 100n;
           } else if (config.gasLevel === 'low') {
-            gasPrice = (gasPrice * 80n) / 100n; // 20% less
+            gasPrice = (gasPrice * 80n) / 100n;
           }
           
           addLog(`⛽ Gas price: ${ethers.formatUnits(gasPrice, 'gwei')} Gwei`, 'info');
           
-          // Send mint transaction
           const mintValue = ethers.parseEther(mintPrice);
           
           addLog(`📤 Sending transaction...`, 'info');
-          const tx = await contract[mintFunctionName]({
-            value: mintValue,
-            gasPrice: gasPrice,
-          });
+          
+          const tx = mintFunctionHasQuantity
+            ? await contract[mintFunctionName](1, {
+                value: mintValue,
+                gasPrice: gasPrice,
+              })
+            : await contract[mintFunctionName]({
+                value: mintValue,
+                gasPrice: gasPrice,
+              });
           
           addLog(`⏳ Waiting for confirmation... TX: ${tx.hash}`, 'info');
           
@@ -467,7 +482,6 @@ const OpenSeaAutoMint = () => {
       
       setWallets([...updatedWallets]);
       
-      // 5 second delay between wallets
       if (i < updatedWallets.length - 1) {
         addLog(`⏳ Waiting 5 seconds before next wallet...`, 'info');
         await new Promise(resolve => setTimeout(resolve, 5000));
@@ -494,10 +508,12 @@ const OpenSeaAutoMint = () => {
     setMintPrice('0');
     setEstimatedGas('0');
     setDetectedChain('');
+    setChainSymbol('ETH');
     setMintPhases({ public: false, whitelist: false, allowlist: false });
     setAdvancedOptions({ autoRetry: false, sniperMode: false, flashbots: false });
     setContractABI(null);
     setMintFunctionName('');
+    setMintFunctionHasQuantity(false);
   };
   
   const getStatusIcon = (status) => {
@@ -550,6 +566,7 @@ const OpenSeaAutoMint = () => {
       10: 'https://optimistic.etherscan.io',
       8453: 'https://basescan.org',
       56: 'https://bscscan.com',
+      33139: 'https://apescan.io',
     };
     
     return `${explorers[chainId] || 'https://etherscan.io'}/tx/${txHash}`;
@@ -680,26 +697,6 @@ const OpenSeaAutoMint = () => {
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={mintPhases.public}
-                        onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Public Mint</span>
-                    </label>
-                    
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={mintPhases.whitelist}
-                        onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Whitelist Mint</span>
-                    </label>
-                    
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
                         checked={mintPhases.allowlist}
                         onChange={(e) => setMintPhases({ ...mintPhases, allowlist: e.target.checked })}
                         className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
@@ -791,7 +788,7 @@ const OpenSeaAutoMint = () => {
                           <p className="text-white font-mono text-sm">
                             {wallet.address.slice(0, 6)}...{wallet.address.slice(-4)}
                           </p>
-                          <p className="text-gray-400 text-xs">Balance: {wallet.balance} ETH</p>
+                          <p className="text-gray-400 text-xs">Balance: {wallet.balance} {chainSymbol}</p>
                         </div>
                       </div>
                       <div className="text-right">
@@ -849,16 +846,16 @@ const OpenSeaAutoMint = () => {
                 <div className="space-y-3">
                   <div className="flex justify-between">
                     <span className="text-gray-400">Mint Price:</span>
-                    <span className="text-white font-semibold">{mintPrice} ETH</span>
+                    <span className="text-white font-semibold">{mintPrice} {chainSymbol}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gray-400">Est. Gas:</span>
-                    <span className="text-white font-semibold">{estimatedGas} ETH</span>
+                    <span className="text-white font-semibold">{estimatedGas} {chainSymbol}</span>
                   </div>
                   <div className="flex justify-between pt-2 border-t border-slate-700">
                     <span className="text-gray-400">Total Cost:</span>
                     <span className="text-purple-400 font-bold">
-                      {(parseFloat(mintPrice) + parseFloat(estimatedGas)).toFixed(4)} ETH
+                      {(parseFloat(mintPrice) + parseFloat(estimatedGas)).toFixed(4)} {chainSymbol}
                     </span>
                   </div>
                   {detectedChain && (
@@ -870,7 +867,9 @@ const OpenSeaAutoMint = () => {
                   {mintFunctionName && (
                     <div className="flex justify-between">
                       <span className="text-gray-400">Mint Function:</span>
-                      <span className="text-white font-mono text-sm">{mintFunctionName}()</span>
+                      <span className="text-white font-mono text-sm">
+                        {mintFunctionName}({mintFunctionHasQuantity ? 'uint256' : ''})
+                      </span>
                     </div>
                   )}
                 </div>
@@ -918,4 +917,24 @@ const OpenSeaAutoMint = () => {
   );
 };
 
-export default OpenSeaAutoMint;
+export default OpenSeaAutoMint;pointer">
+                      <input
+                        type="checkbox"
+                        checked={mintPhases.public}
+                        onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Public Mint</span>
+                    </label>
+                    
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mintPhases.whitelist}
+                        onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Whitelist Mint</span>
+                    </label>
+                    
+                    <label className="flex items-center gap-2 cursor-
