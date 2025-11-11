@@ -630,7 +630,7 @@ const OpenSeaAutoMint = () => {
                     rows={4}
                     className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono text-sm"
                   />
-                  <p className="text-xs text-gray-400mt-1">
+                  <p className="text-xs text-gray-400 mt-1">
                     {parsePrivateKeys(config.privateKeys).length}/10 valid wallets
                   </p>
                 </div>
@@ -805,7 +805,7 @@ const OpenSeaAutoMint = () => {
                           {getStatusText(wallet)}
                         </p>
                         {wallet.txHash && (
-                          
+                          <a
                             href={getExplorerUrl(1, wallet.txHash)}
                             target="_blank"
                             rel="noopener noreferrer"
@@ -919,36 +919,3 @@ const OpenSeaAutoMint = () => {
 };
 
 export default OpenSeaAutoMint;
-```
-
-## 📄 **.gitignore**
-```
-# Dependencies
-node_modules
-/.pnp
-.pnp.js
-
-# Testing
-/coverage
-
-# Production
-/build
-/dist
-
-# Misc
-.DS_Store
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Editor
-.vscode
-.idea
-*.swp
-*.swo
-*~
