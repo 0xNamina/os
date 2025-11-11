@@ -209,6 +209,31 @@ const OpenSeaAutoMint = () => {
       return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0 };
     }
   };
+      
+      const chains = {
+        1: { name: 'Ethereum Mainnet', symbol: 'ETH' },
+        5: { name: 'Goerli Testnet', symbol: 'ETH' },
+        11155111: { name: 'Sepolia Testnet', symbol: 'ETH' },
+        137: { name: 'Polygon', symbol: 'MATIC' },
+        80001: { name: 'Mumbai Testnet', symbol: 'MATIC' },
+        42161: { name: 'Arbitrum One', symbol: 'ETH' },
+        10: { name: 'Optimism', symbol: 'ETH' },
+        8453: { name: 'Base', symbol: 'ETH' },
+        43114: { name: 'Avalanche', symbol: 'AVAX' },
+        56: { name: 'BSC', symbol: 'BNB' },
+        33139: { name: 'APE Chain', symbol: 'APE' },
+        250: { name: 'Fantom', symbol: 'FTM' },
+        100: { name: 'Gnosis', symbol: 'xDAI' },
+        2522: { name: 'Fraxtal', symbol: 'ETH' },
+      };
+      
+      const chainInfo = chains[chainId] || { name: `Chain ID: ${chainId}`, symbol: 'ETH' };
+      return { name: chainInfo.name, symbol: chainInfo.symbol, chainId };
+    } catch (error) {
+      addLog(`❌ Gagal deteksi chain: ${error.message}`, 'error');
+      return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0 };
+    }
+  };
   
   const getContractABI = async (contractAddress, chainId) => {
     const defaultABI = [
@@ -337,55 +362,55 @@ const OpenSeaAutoMint = () => {
           for (let i = 0; i < keys.length; i++) {
             const key = keys[i];
             
-            try {
-              const wallet = new ethers.Wallet(key, provider);
-              const address = wallet.address;
-              
-              addLog(`  Scan ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
-              
-              const balanceWei = await provider.getBalance(address);
-              const balance = ethers.formatEther(balanceWei);
-              
-              let hasMinted = false;
               try {
-                const nftBalance = await contract.balanceOf(address);
-                hasMinted = Number(nftBalance) > 0;
-              } catch (e) {
-                hasMinted = false;
-              }
-              
-              let gasEstimate = '0.002';
-              try {
-                const estimateParams = { 
-                  value: ethers.parseEther(price),
-                  from: address 
-                };
+                const wallet = new ethers.Wallet(key, provider);
+                const address = wallet.address;
                 
-                const gasLimit = mintFunc.hasQuantity 
-                  ? await contract[mintFunc.name].estimateGas(1, estimateParams)
-                  : await contract[mintFunc.name].estimateGas(estimateParams);
+                addLog(`  Scan ${i + 1}/${keys.length}: ${address.slice(0, 6)}...${address.slice(-4)}`, 'info');
+                
+                const balanceWei = await provider.getBalance(address);
+                const balance = ethers.formatEther(balanceWei);
+                
+                let hasMinted = false;
+                try {
+                  const nftBalance = await contract.balanceOf(address);
+                  hasMinted = Number(nftBalance) > 0;
+                } catch (e) {
+                  hasMinted = false;
+                }
+                
+                let gasEstimate = '0.002';
+                try {
+                  const estimateParams = { 
+                    value: ethers.parseEther(price),
+                    from: address 
+                  };
                   
-                const feeData = await provider.getFeeData();
-                const gasCost = gasLimit * feeData.gasPrice;
-                gasEstimate = ethers.formatEther(gasCost);
-              } catch (e) {
-                // Use default
+                  const gasLimit = mintFunc.hasQuantity 
+                    ? await contract[mintFunc.name].estimateGas(1, estimateParams)
+                    : await contract[mintFunc.name].estimateGas(estimateParams);
+                    
+                  const feeData = await provider.getFeeData();
+                  const gasCost = gasLimit * feeData.gasPrice;
+                  gasEstimate = ethers.formatEther(gasCost);
+                } catch (e) {
+                  // Use default
+                }
+                
+                contractScanned.push({
+                  address,
+                  privateKey: key,
+                  balance,
+                  hasMinted,
+                  status: hasMinted ? 'already_minted' : 'ready',
+                  gasEstimate,
+                });
+                
+                await new Promise(resolve => setTimeout(resolve, 300));
+                
+              } catch (error) {
+                addLog(`  ❌ Error: ${error.message}`, 'error');
               }
-              
-              contractScanned.push({
-                address,
-                privateKey: key,
-                balance,
-                hasMinted,
-                status: hasMinted ? 'already_minted' : 'ready',
-                gasEstimate,
-              });
-              
-              await new Promise(resolve => setTimeout(resolve, 300));
-              
-            } catch (error) {
-              addLog(`  ❌ Error: ${error.message}`, 'error');
-            }
           }
           
           scannedContracts.push({
@@ -569,16 +594,24 @@ const OpenSeaAutoMint = () => {
             throw new Error('Semua metode mint gagal');
           }
           
-          addLog(`⏳ Menunggu konfirmasi... TX: ${tx.hash}`, 'info');
-          
-          const receipt = await tx.wait();
-          
-          if (receipt.status === 1) {
-            mintSuccess = true;
-            txHash = receipt.hash;
-            addLog(`✅ Berhasil! TX: ${txHash}`, 'success');
+          if (tx && tx.hash) {
+            addLog(`⏳ Menunggu konfirmasi... TX: ${tx.hash}`, 'info');
+            
+            try {
+              const receipt = await tx.wait();
+              
+              if (receipt && receipt.status === 1) {
+                mintSuccess = true;
+                txHash = receipt.hash;
+                addLog(`✅ Berhasil! TX: ${txHash}`, 'success');
+              } else {
+                throw new Error('Transaksi reverted di blockchain - cek contract conditions');
+              }
+            } catch (waitError) {
+              throw new Error(`Error menunggu tx: ${waitError.message}`);
+            }
           } else {
-            throw new Error('Transaksi reverted di blockchain - cek contract conditions');
+            throw new Error('Transaksi tidak dikembalikan');
           }
           
         } catch (error) {
