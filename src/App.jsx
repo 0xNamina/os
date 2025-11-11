@@ -118,8 +118,9 @@ const OpenSeaAutoMint = () => {
     }
   };
   
- const getGenericABI = () => {
+const getGenericABI = () => {
     return [
+      // Basic mint functions
       "function mint() public payable",
       "function publicMint() public payable",
       "function mint(uint256 quantity) public payable",
@@ -131,19 +132,37 @@ const OpenSeaAutoMint = () => {
       "function buy(uint256 quantity) public payable",
       "function claim() public payable",
       "function claim(uint256 quantity) public payable",
+      
+      // Proof-based mints
       "function whitelistMint(bytes32[] proof) public payable",
       "function allowlistMint(bytes32[] proof, uint256 quantity) public payable",
       "function mintWithSignature(bytes signature, uint256 quantity) public payable",
+      
+      // Getters for price
       "function mintPrice() public view returns (uint256)",
       "function cost() public view returns (uint256)",
       "function price() public view returns (uint256)",
       "function getPrice() public view returns (uint256)",
+      "function getMintPrice() public view returns (uint256)",
+      
+      // Supply and status
       "function totalSupply() public view returns (uint256)",
       "function maxSupply() public view returns (uint256)",
       "function balanceOf(address owner) public view returns (uint256)",
+      
+      // Status checks
       "function paused() public view returns (bool)",
       "function publicSaleActive() public view returns (bool)",
       "function saleIsActive() public view returns (bool)",
+      "function mintEnabled() public view returns (bool)",
+      
+      // Eligibility checks
+      "function canMint(address) public view returns (bool)",
+      "function isEligible(address) public view returns (bool)",
+      "function maxPerWallet() public view returns (uint256)",
+      "function maxPerAddress() public view returns (uint256)",
+      "function numberMinted(address) public view returns (uint256)",
+      "function mintedPerAddress(address) public view returns (uint256)",
     ];
   };
   
