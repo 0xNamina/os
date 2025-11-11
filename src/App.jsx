@@ -95,7 +95,7 @@ const OpenSeaAutoMint = () => {
   
   const getContractABI = async (contractAddress, chainId) => {
     const apiKeys = {
-      1: 'YourEtherscanAPIKey',
+      1: 'HUCJSQE1V4UXYGZXIG9S7Z29WMM75ZC6EZ',
       137: 'YourPolygonscanAPIKey',
     };
     
