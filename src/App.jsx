@@ -204,8 +204,8 @@ const OpenSeaAutoMint = () => {
       
       const chainInfo = chains[chainId] || { name: `Chain ID: ${chainId}`, symbol: 'ETH' };
       return { name: chainInfo.name, symbol: chainInfo.symbol, chainId };
-    } catch (error) {
-      addLog(`❌ Gagal deteksi chain: ${error.message}`, 'error');
+    } catch (err) {
+      addLog(`Chain detection error: ${err.message}`, 'error');
       return { name: 'Unknown Chain', symbol: 'ETH', chainId: 0 };
     }
   };
