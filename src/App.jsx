@@ -1,13 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Loader2, CheckCircle, XCircle, Clock, AlertCircle, Scan, Zap } from 'lucide-react';
 
-// Import ethers from CDN
-const ethers = window.ethers || (() => {
-  const script = document.createElement('script');
-  script.src = 'https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js';
-  document.head.appendChild(script);
-  return null;
-})();
+const ethers = window.ethers;
 
 const OpenSeaAutoMint = () => {
   const [config, setConfig] = useState({
@@ -697,6 +691,26 @@ const OpenSeaAutoMint = () => {
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
+                        checked={mintPhases.public}
+                        onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Public Mint</span>
+                    </label>
+                    
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mintPhases.whitelist}
+                        onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
+                      />
+                      <span className="text-white">Whitelist Mint</span>
+                    </label>
+                    
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
                         checked={mintPhases.allowlist}
                         onChange={(e) => setMintPhases({ ...mintPhases, allowlist: e.target.checked })}
                         className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
@@ -917,24 +931,4 @@ const OpenSeaAutoMint = () => {
   );
 };
 
-export default OpenSeaAutoMint;pointer">
-                      <input
-                        type="checkbox"
-                        checked={mintPhases.public}
-                        onChange={(e) => setMintPhases({ ...mintPhases, public: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Public Mint</span>
-                    </label>
-                    
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={mintPhases.whitelist}
-                        onChange={(e) => setMintPhases({ ...mintPhases, whitelist: e.target.checked })}
-                        className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-purple-600 focus:ring-2 focus:ring-purple-500"
-                      />
-                      <span className="text-white">Whitelist Mint</span>
-                    </label>
-                    
-                    <label className="flex items-center gap-2 cursor-
+export default OpenSeaAutoMint;
